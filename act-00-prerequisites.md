@@ -149,6 +149,249 @@ codex app-server --listen stdio:// | unix://PATH | ws://IP:PORT
 （`thread/start`、`turn/start`、`thread/read`……），所有前端都只是它的客户端。
 这也是第一幕后面所有调用链都要穿过它的原因。
 
+##### daemon 到底持有什么
+
+一句话：**daemon 持有 `ThreadManager` 和所有 `Session`。**
+
+证据在构造点——`ThreadManager::new` 出现在 `app-server/src/message_processor.rs:335`，
+也就是 **app-server 进程内部**。所以"哪个进程跑 app-server，thread 就活在哪个进程"。
+
+在这个基础上，daemon 承担七件事：
+
+| # | 职责 | 依据 |
+|---|---|---|
+| 1 | **持有 thread 生命周期** | thread 从 start 到 stop 全在 daemon 里；TUI 断开 ≠ thread 结束 |
+| 2 | **跨客户端共享 thread** | 多个前端连同一个 daemon，看到同一批会话 |
+| 3 | **存活与恢复** | 关闭时写 recovery snapshot，下次启动后台冷恢复（`app-server/src/daemon_thread_recovery.rs`） |
+| 4 | **多入口的统一出口** | `codex agents` / `queue` / `archive` / `delete` 都通过它操作 thread |
+| 5 | **进程级共享资源** | model catalog、auth refresh、plugins/skills watcher，一个进程一份 |
+| 6 | **远程控制** | `codex remote-control` 让 daemon 可被远程控制 |
+| 7 | **自身生命周期管理** | `daemon start\|stop\|restart\|version`，用文件锁序列化多个 CLI 调用 |
+
+第 3 条值得展开。`daemon_thread_recovery.rs` 的模块注释：
+
+> Saves persistent root thread IDs and restores them through the shared internal resume path.
+> Recovery uses normal cold-resume semantics without delaying readiness for runtime loading.
+> **Already-loaded runtimes remain owned by their current clients.**
+
+——daemon 重启后会把之前加载的 thread 冷恢复回来，用的是**和 resume 同一条路径**。这就是
+"TUI 关了但任务还在"的实现基础。
+
+补一个容易忽略的点：daemon 是**受管安装**的（`managed_codex_bin` / `install_lock` /
+`update_loop`），所以它**可以和 CLI 跑不同版本**——这正是那套 `compatibility_warning` /
+`server_features` 检查存在的原因。
+
+##### "只能有一个 owner"：为什么 `codex queue` 会拒绝
+
+这是整个设计里最关键、也最容易忽略的一条约束。
+
+`codex queue` 的拒绝逻辑有两道（`tui/src/session_queue_commands.rs:31`）：
+
+```rust
+if options.cli.no_daemon && options.explicit_remote_endpoint.is_none() {
+    return Err(eyre!(
+        "--no-daemon cannot be used with codex queue. Queuing must discover the shared server
+         to avoid writing through a separate server."
+    ));
+}
+```
+
+```rust
+if !explicit_remote
+    && app_server.uses_embedded_app_server()
+    && super::maybe_probe_default_daemon_socket(codex_home.as_path()).await.is_some()
+{
+    return Err(eyre!(
+        "cannot queue through an embedded app server while a local app-server daemon is
+         running; remove configuration overrides or use --remote"
+    ));
+}
+```
+
+**注意第二道**：embedded 明明能跑，但只要探测到 daemon 还在，就**拒绝**。理由是"避免通过
+另一个 server 写入"。
+
+所以设计意图不是"有 daemon 更好用"，而是：**同一个 `CODEX_HOME` 下，thread 状态只能有一个
+owner；当 daemon 存在时，其他形态必须让路。**
+
+##### `--no-daemon` 到底会不会报错
+
+结论是**不会**——但要分层看，因为拒绝发生在三个不同的地方。
+
+**第一层：启动期不拦。** flag 的文档就是这么写的（`tui/src/cli.rs:83`）：
+
+```rust
+/// Run without the shared background server, even if it is already running.
+#[arg(long)]
+pub no_daemon: bool,
+```
+
+而且代码路径**根本不探测 daemon**（`tui/src/startup_orchestration.rs:183`）：
+
+```rust
+let reuse_implicit_local_daemon = daemon_exclusion.is_none();
+```
+
+`--no-daemon` 让 `daemon_exclusion` 返回 `Some("--no-daemon")`，于是这个值是 `false`，
+`app_server_target_for_launch` 直接落到 `None => AppServerTarget::Embedded`。
+没有 socket 探测、没有连接尝试、没有版本比对。
+
+**第二层：特定命令在参数校验时就拒绝。** 理由是这些命令**语义上依赖共享状态**：
+
+```text
+codex agents --no-daemon   ->  "The agents overview requires a shared server."
+codex queue  --no-daemon   ->  "Queuing must discover the shared server..."
+codex --no-daemon --remote ->  "--no-daemon cannot be used with --remote."（自相矛盾）
+```
+
+**第三层：真正的资源冲突由文件锁兜底。**
+
+如果 `--no-daemon` 要接管的正是 daemon 里正在跑的那条 thread，会在写锁那一层失败
+（`rollout/src/writer_lock.rs`）：
+
+```rust
+const WRITER_LOCK_DIR: &str = "thread-writer-locks";
+
+/// Coordinates writer ownership within one Codex home.
+pub struct WriterLockCoordinator { ... }
+
+/// Acquires exclusive writer ownership, returning `WouldBlock` for an active writer.
+pub fn acquire(self: &Arc<Self>, thread_id: ThreadId) -> io::Result<WriterLockGuard> {
+    let path = self.directory.join(format!("{thread_id}.lock"));
+    match file.try_lock() {
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => { /* 有活跃 writer */ }
+        ...
+    }
+}
+```
+
+`thread-store/src/local/mod.rs:338` 把它映射成 `ThreadStoreError::Conflict`。
+也就是**每个 thread 有一把跨进程的 OS 文件锁**，落在
+`$CODEX_HOME/thread-writer-locks/<thread_id>.lock`。
+
+三种情况合起来看：
+
+| 场景 | 结果 | 在哪一层被拦 |
+|---|---|---|
+| `codex --no-daemon` 起新会话 | ✅ 正常 | 不拦 |
+| `codex --no-daemon resume <不活跃 thread>` | ✅ 正常 | 不拦（daemon 没持锁） |
+| `codex --no-daemon resume <活跃 thread>` | ❌ Conflict | **文件锁** |
+| `codex agents --no-daemon` | ❌ | **参数校验** |
+| `codex queue --no-daemon` | ❌ | **参数校验** |
+
+这个分层不是巧合：**`--no-daemon` 是"我自愿放弃共享"，文件锁是"共享状态的硬边界"**，
+两者分工不同，所以行为也不同。
+
+##### TUI 从 app-server 拿什么
+
+TUI **从不直接调 core**，它是 app-server 的纯客户端。依赖面可以数出来——用到的
+`ClientRequest` 有 80 多个，归纳成六类：
+
+| 类别 | 代表方法 |
+|---|---|
+| 会话生命周期 | `ThreadStart` / `ThreadResume` / `ThreadFork` / `ThreadDelete` / `ThreadArchive` / `ThreadList` / `ThreadRead` / `ThreadSearch` |
+| turn 控制 | `TurnStart` / `TurnSteer` / `TurnInterrupt` / `ThreadCompactStart` |
+| **反向请求**（server → client） | `ExecCommandApproval` / `ApplyPatchApproval` / `McpElicitation` / `ToolRequestUserInput` / `DynamicToolCall` / `AttestationGenerate` / `CurrentTimeRead` |
+| 配置与账号 | `ConfigRead` / `ConfigBatchWrite` / `LoginAccount` / `GetAccount` / `GetAccountRateLimits` |
+| 扩展生态 | `PluginInstall` / `McpServerStatusList` / `SkillsList` / `MarketplaceUpgrade` / `HooksList` |
+| 平台能力 | `FsReadFile` / `FsWriteFile` / `FsRemove` / `OneOffCommandExec` / `WindowsSandboxSetupStart` |
+
+**第三类最需要留意**：审批、提问、MCP 授权、动态工具、证明生成、当前时间——这些是
+**server 向 client 要东西**。也就是说 TUI 不只是消费者，它还是某些能力的**提供方**：
+渲染审批弹窗、让用户回答问题、执行 dynamic tool、生成 attestation。
+
+**这是双向依赖，不是单向调用。**
+
+##### 两个只有共享 server 才能做的功能
+
+有了 daemon 之后才可能出现两类"跨会话操作"，它们也是理解前面那些拒绝逻辑的最好例子。
+
+**`codex queue`：往已有会话投递消息**
+
+```bash
+codex queue --thread <会话 UUID 或名字> --message "<文本>"
+```
+
+机制（`ext/queue/src/service.rs`）：
+
+| 环节 | 实现 |
+|---|---|
+| 存储 | `QueueStore`（durable，落在 thread-store / SQLite） |
+| 发现 | `watch_external_messages` **每 10 秒**查一次 SQLite 的 data version，只挑变化的 thread |
+| 派发 | `on_thread_idle`（`ThreadLifecycleContributor`）→ `dispatch_if_idle` |
+| 起 turn | `thread.start_turn_if_idle(...)` |
+| 成功才删 | `Started` 才删队列项，失败留着重试 |
+
+两个语义细节：
+
+```rust
+// 被打断时不派发 —— 中断是明确意图，不该被队列覆盖
+if input.cause == ThreadIdleCause::Interrupted {
+    return;
+}
+```
+
+```rust
+// 只接受用户输入，其它类型丢弃
+if !matches!(input, TurnInput::UserInput { .. }) {
+    tracing::warn!(%queued_item_id, "discarding non-user queued input");
+    self.delete_locked(thread_id, queued_item_id).await?;
+    continue;
+}
+```
+
+它和 steer 的区别在于**时机**：
+
+| | steer（`TurnSteer`） | queue（`codex queue`） |
+|---|---|---|
+| 时机 | 插进**正在跑**的 turn | 等 turn 结束、线程空闲 |
+| 立刻性 | 立即 | 最多 10 秒轮询延迟 + 等空闲 |
+
+典型场景：脚本或 CI 往一个正在运行的会话追加指令，不用重新开会话、不用 resume。
+
+**`codex agents`：daemon 范围的会话总览**
+
+模块注释（`tui/src/app/agents_overview.rs`）把定位写得很清楚：
+
+> Daemon-wide overview of recent and locally retained sessions **and their subagents**.
+> Tasks owned by another app server open as **frozen, read-only history snapshots**.
+> Only the immediate attachment of a dashboard-created task is treated as fresh.
+
+三件事：**所有会话 + 它们的子 agent**；别的 app-server 实例持有的任务显示为**只读快照**
+（安全：不能两个 TUI 同时写）；**从面板新建的任务才真正附着**。
+
+功能从模块名就能看出来：
+
+| 模块 | 作用 |
+|---|---|
+| `agents_overview_grouping.rs` | 分组（按目录 / 状态等） |
+| `agents_overview_details.rs` | 会话详情与活动 |
+| `agents_overview_usage.rs` | 用量统计 |
+| `agents_overview_new.rs` | **从面板新建任务**（含 worktree，`PendingWorktree`） |
+| `agents_overview_actions.rs` | 对会话执行动作（归档 / 删除 / 重命名…） |
+
+启动时它还会先确保 daemon 起来，失败时的提示很直白：
+
+```text
+The agents overview requires a shared server. Use codex --no-daemon to work without it.
+```
+
+典型场景：同时开着好几条会话（不同 worktree、不同任务）当调度台用；追父 agent 派生的
+subagent；看到某条卡住了直接附着接管。
+
+**放在一起看**：
+
+| | `codex queue` | `codex agents` |
+|---|---|---|
+| 方向 | 向**已有会话**投递 | **浏览 / 选择**会话 |
+| 界面 | 无，一条命令 | TUI 面板 |
+| 是否产生 turn | ✅ 触发一次新 turn | ❌ 除非你附着或操作 |
+| 对状态的要求 | 那条 thread **已加载** | **看到**所有 thread |
+| 为什么必须共享 server | 队列要投给持有它的那个实例 | 要看到别的客户端开的会话 |
+
+底层原因是同一个：**thread 状态归 app-server 持有**。所以任何"从外部操作一个 thread"的
+功能，都必须连上持有它的那个 server。
+
 #### 4. exec-server
 
 `codex-rs/exec-server` 是一个独立的小 JSON-RPC 服务，通过 `codex-utils-pty`

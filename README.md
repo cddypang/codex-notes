@@ -43,7 +43,7 @@ commit  8c3612fb638d356579c446de68421288164484dc
 
 | 文档 | 行数 | 内容 | 状态 |
 |---|---|---|---|
-| [act-00-prerequisites.md](act-00-prerequisites.md) | 649 | **第零幕 · 预备知识**：进程与角色、基础结构（`ThreadManager` / `CodexThread` / `Session`……）、设计原则与前置知识 | ✅ 完成 |
+| [act-00-prerequisites.md](act-00-prerequisites.md) | 892 | **第零幕 · 预备知识**：进程与角色（含 daemon 职责、`--no-daemon` 行为、`codex agents` / `queue`）、基础结构（`ThreadManager` / `CodexThread` / `Session`……）、设计原则与前置知识 | ✅ 完成 |
 | [act-01-minimal-loop.md](act-01-minimal-loop.md) | 1701 | **第一幕 · 最小闭环**：§1 启动与线程模型、§2 turn 生命周期、§3 模型接入、§4 上下文组装、§5 world state 与增量渲染 | ✅ 完成 |
 | [act-02-tool-loop.md](act-02-tool-loop.md) | 154 | **第二幕 · 工具循环**：§6 工具抽象、§7 工具循环与并发、§8 审批与安全边界 | 📝 大纲 |
 | [act-03-memory-and-extensions.md](act-03-memory-and-extensions.md) | 234 | **第三幕 · 记忆与扩展**：§9 持久化与恢复、§10 Contributor 框架、§11 Skill、§12 Memory、§13 MCP + Plugin + Apps | 📝 大纲 |
