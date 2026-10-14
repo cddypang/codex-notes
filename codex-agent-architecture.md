@@ -113,7 +113,7 @@ memories/
   raw_memories.md          # 抽取出的原始记忆
   rollout_summaries/       # 每个 rollout 的摘要
   extensions/              # 额外记忆源，含 instructions.md
-    ad_hoc/notes/          # 用户"记住/忘掉"时追加的小笔记
+    ad_hoc/notes/          # 用户在对话中提出"记住/忘掉"时追加的小笔记
 ```
 
 其他保障：
@@ -467,7 +467,7 @@ for contributor in self.services.extensions.context_contributors() {
 ### 关键映射
 
 ```text
-用户口中的 "session"  ==  代码里的 thread  ==  一个 rollout 文件
+用户界面上的 "session"  ==  代码里的 thread  ==  一个 rollout 文件
 ```
 
 `thread-store/src/lib.rs` 的注释：

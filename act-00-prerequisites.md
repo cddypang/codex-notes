@@ -83,7 +83,7 @@ argv[1] == core apply patch         ->  apply_patch
 
 ##### 到底会选哪一个
 
-由 `startup_orchestration.rs:484` 决定：
+由 `startup_orchestration.rs:494` 决定：
 
 ```rust
 let auto_start_daemon = config.features.enabled(Feature::DaemonAutoStart)
@@ -110,7 +110,7 @@ CODEX_EXEC_SERVER_URL          # executor 选择
 ```
 
 走 daemon 那一步是 `codex_app_server_daemon::start_with_features(...)`
-（`startup_orchestration.rs:534`）；成功后设置：
+（`startup_orchestration.rs:530`）；成功后设置：
 
 ```rust
 app_server_target = AppServerTarget::LocalDaemon {
@@ -142,11 +142,12 @@ start_embedded_app_server(...).await.map(AppServerClient::InProcess)
 codex app-server --listen stdio:// | unix://PATH | ws://IP:PORT
 ```
 
-（默认 `stdio://`，见 `cli/src/main.rs:565` 的 `AppServerCommand`。）
+（默认 `stdio://`，`AppServerCommand` 见 `cli/src/main.rs:553`，其 `--listen` 默认值在 `:565`。）
 
 **为什么必须要有这一层**：如果 TUI 直接调 core，那 IDE 扩展就得把"怎么开会话、
-怎么提交 turn、怎么处理审批"再实现一遍。有了 app-server，core 只需要认识一套 JSON-RPC
-（`thread/start`、`turn/start`、`thread/read`……），所有前端都只是它的客户端。
+怎么提交 turn、怎么处理审批"再实现一遍。有了 app-server，**只有它认识 JSON-RPC**
+（`thread/start`、`turn/start`、`thread/read`……），**core 只认识 Rust API**；
+所有前端都只是 app-server 的客户端。
 这也是第一幕后面所有调用链都要穿过它的原因。
 
 ##### daemon 到底持有什么
@@ -185,7 +186,7 @@ codex app-server --listen stdio:// | unix://PATH | ws://IP:PORT
 
 这是整个设计里最关键、也最容易忽略的一条约束。
 
-`codex queue` 的拒绝逻辑有两道（`tui/src/session_queue_commands.rs:31`）：
+`codex queue` 的拒绝逻辑有两道（`tui/src/session_queue_commands.rs:32`）：
 
 ```rust
 if options.cli.no_daemon && options.explicit_remote_endpoint.is_none() {
@@ -408,7 +409,8 @@ forward --connect ws://HOST:PORT --remote URL    # 转发
 
 #### 5. code-mode host
 
-Code Mode 的 V8 **跑在独立进程里**：
+"Code Mode" 是一种可选的**工具调用方式**：模型不再一轮发一个工具调用，而是写一段
+JavaScript 把多次调用组织起来。执行这段 JS 的 V8 **跑在独立进程里**：
 
 ```rust
 // code-mode/src/remote_session/connection.rs:158
@@ -849,8 +851,8 @@ app-server 默认关闭 analytics，IDE 那类第一方客户端才通过
 
 ```text
 arg0/src/lib.rs:236     "Runtime::block_on otherwise runs the top-level future on the caller's OS stack."
-cli/src/main.rs:1018    "Keep the CLI dispatcher off the runtime's stack while the TUI rebuilds a thread."
-tui/src/lib.rs:2031     "Keep the large event-loop future out of the enclosing startup futures..."
+cli/src/main.rs:1017    "Keep the CLI dispatcher off the runtime's stack while the TUI rebuilds a thread."
+tui/src/lib.rs:2032     "Keep the large event-loop future out of the enclosing startup futures..."
 core/src/session/mod.rs:511   #[inline(never)]
 ```
 

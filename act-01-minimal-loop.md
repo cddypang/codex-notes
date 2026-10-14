@@ -55,16 +55,18 @@ while true {
 
 ### ② 代码入口
 
-以交互式启动（`codex` 不带子命令）为例。下面这条链是**可以一步步跳的**：
+跟的是**交互式启动 + `--no-daemon`** 这条分支。下面这条链是**可以一步步跳的**：
 每一行都是 `文件:行 -> 函数名`，按顺序在编辑器里打开就能走到底。
+
+为什么选这条：**不带参数启动时，app-server 默认以 daemon 形式跑在另一个进程里**，
+调用链在那里就断了。先跟单进程分支，链路才是连续的。（`--oss`、`--profile`、
+自定义 `-c` 等也走同一条分支。）
 
 这条链会依次穿过 [第零幕](act-00-prerequisites.md)「六类进程」表格里的第 1 类（`codex` 主进程）、
 第 2 类（arg0 分派）、第 3 类（app-server），最后落到 core。
 
-为简化，这里跟的是 **Embedded** 那条分支，等价于加了 `--no-daemon`。
-第 21a 步的 `start_app_server` 正是分流点：如果 `target` 是 `LocalDaemon`，
-它会先 `app_server_connection::connect(target)`，连上之后**后面整条链都发生在 daemon 进程里**，
-本文档的其余部分仍然成立，只是进程边界变了（见[第零幕：进程与角色](act-00-prerequisites.md#进程与角色)）。
+第 21 步会决定 **app-server 起在哪个进程**；daemon 分支的进程结构见
+[第零幕：进程与角色](act-00-prerequisites.md#进程与角色)。
 
 #### 第 0 步：进程入口（从 `fn main` 开始）
 
@@ -76,10 +78,10 @@ while true {
 5. arg0/src/lib.rs:238                       std::thread::Builder::new()
 6. arg0/src/lib.rs:243                         runtime.block_on(run_main_with_arg0_guard(..))
 7. arg0/src/lib.rs:255                     run_main_with_arg0_guard  ->  调用闭包 main_fn(paths)
-8. cli/src/main.rs:1017                    （闭包体）cli_main(arg0_paths, remote_control_disabled)
+8. cli/src/main.rs:1018                    （闭包体）cli_main(arg0_paths, remote_control_disabled)
 9. cli/src/main.rs:1023                    cli_main
-10. cli/src/main.rs:1029                     MultitoolCli::parse()
-11. cli/src/main.rs:1080                     match subcommand { None | Some(Subcommand::Agents(_)) => { ... } }
+10. cli/src/main.rs:1033                     MultitoolCli::parse()
+11. cli/src/main.rs:1078                     match subcommand { None | Some(Subcommand::Agents(_)) => { ... } }
 12. cli/src/main.rs:1122                       run_interactive_tui(...)
 ```
 
@@ -117,18 +119,49 @@ while true {
 （`cli/src/main.rs:2454`），后者是个重试循环——`local_state_db` 被锁或损坏时会尝试自动备份重建。
 这也解释了为什么要用闭包而不是直接调用：**TUI 可能要启动两次**。
 
-`run_ratatui_app`（`tui/src/lib.rs:1127`）里做两件事，顺序很重要：
+`run_ratatui_app`（`tui/src/lib.rs:1127`）里，21 和 22 之间还夹着约 800 行的启动期决策
+（`tui/src/lib.rs:1214–2030`）：
 
 ```text
-21a. tui/src/lib.rs:1197   start_app_server(...)     # 先把 app-server 起起来
-      tui/src/lib.rs:551    start_app_server
-      tui/src/lib.rs:284      start_embedded_app_server
-      tui/src/lib.rs:673        start_embedded_app_server_with
-      app-server-client/src/lib.rs:355  InProcessAppServerClient::start
-      app-server/src/in_process.rs:377  start            # 服务端在这里诞生（同进程）
+21. tui/src/lib.rs:1197    start_app_server(...)  ->  AppServerClient
+      tui/src/lib.rs:551    start_app_server          # 按 target 决定 server 起在哪
+      │
+      │  target == Embedded（本文档跟的分支）
+      ├─  tui/src/lib.rs:284      start_embedded_app_server
+      │     tui/src/lib.rs:673        start_embedded_app_server_with
+      │       app-server-client/src/lib.rs:355   InProcessAppServerClient::start
+      │         app-server/src/in_process.rs:377   start   # 服务端在这里诞生（同进程）
+      │     -> AppServerClient::InProcess
+      │
+      │  target == LocalDaemon / Remote
+      └─  app_server_connection::connect(target)           # 连到对方进程里的 server
+          -> AppServerClient（远程形态）
 
-21b. tui/src/lib.rs:2034   App::run(...)             # 再进事件循环
+      ↓ 启动期的一次性决策（tui/src/lib.rs:1214–2030）
+        ① 包装成 AppServerSession（任一步失败都恢复终端并返回）
+        ② 查登录状态 → 决定要不要跑 onboarding
+        ③ 解析 SessionSelection：新会话 / resume / fork / agents overview
+        ④ 选择落定后再重载一次配置（注释：the last possible reload）
+        ⑤ 目录信任检查（remote 与本地走不同路径）
+        ⑥ 收尾 UI 状态：主题、alt-screen、首次运行标记
+        ⑦ 并行预取 bootstrap 与 hooks 条目
+        ⑧ hooks 审查
+
+22. tui/src/lib.rs:2034    App::run(...)             # 两种结果都走到这里
 ```
+
+这八件事必须在进循环之前定下来，因为进去之后再改代价很高：改配置要重建 chat widget、
+换主题要重绘、切会话要重启会话运行时。而且它们几乎都包在
+`startup_draft.run_until(&mut tui, ...)` 里——每处耗时操作都在渲染循环的照看下执行，
+**所以启动时看到的是一个能响应的画面，不是黑屏等待**。
+
+注意这**不是调用链分叉**：`start_app_server` 无论走哪条子路径，返回的都是同一个
+`AppServerClient`；`run_ratatui_app` 拿到后统一包成 `AppServerSession`，再进 `App::run`。
+变的只是"server 跑在哪个进程"，不是"接下来调用谁"。
+
+而且连"走哪条子路径"都不是静态的：daemon 连不上、且 `allow_embedded_fallback` 为真时，
+函数内部会**把 `target` 改回 `Embedded`**，然后落到末尾起同进程 server——这就是第零幕里
+说的"可选附着会降级"。
 
 注意 `start_embedded_app_server` 本身只是把调用**装箱下沉**一层
 （`Box::pin(start_embedded_app_server_with(..., InProcessAppServerClient::start))`），
@@ -138,7 +171,7 @@ while true {
 
 #### 第 2 步：TUI 发起 `thread/start`
 
-接着上一步（21b）留下的 `App::run`（`tui/src/app/startup.rs:178`）继续：
+接着上一步（22）留下的 `App::run`（`tui/src/app/startup.rs:178`）继续：
 
 ```text
 23. tui/src/app/startup.rs:424              spawn_startup_thread_start(...)   # 调用点
@@ -200,19 +233,49 @@ initial_history: match session_start_source
 注意第 33 → 36 步跨了两个类型：`ThreadManager`（`impl` 从 `:519` 开始）只是个外壳，
 真正的注册表在 `ThreadManagerState`（`impl` 从 `:1606` 开始）。第 35 步是这一跳的证据。
 
-第 39 步返回 `(Arc<Session>, SessionIo)`，一路冒泡回第 36 步，
-组装成 `NewThread`（`core/src/thread_manager.rs:172`）：
+`Session::spawn_internal`（第 39 步）就是"把一条会话从零建起来"，依次做六件事：
+
+```text
+1. 建两个通道：提交通道（bounded 512）+ 事件通道（unbounded）
+2. 解析启动配置：模型 fallback、token budget、base instructions（三级优先级）
+3. 决定历史模式、动态工具、插件选择
+4. 组装 SessionState（可变状态）与 SessionServices（依赖容器）
+5. 起后台 submission_loop —— 这条会话的心跳
+6. 返回 (Arc<Session>, SessionIo)
+```
+
+到这里第一次出现几个后面会反复用的词，先给最小定义：
+
+| 名字 | 是什么 |
+|---|---|
+| `Session` | 会话的**内存运行时**（③b 展开） |
+| `SessionIo` | 与外界的**两条通道**：`Op` 进去、`Event` 出来（③c 展开） |
+| `Op` | 外部提交给会话的操作 |
+| `Event` | 会话向外发出的事件 |
+| `submission_loop` | 后台循环，消费 `Op` 并分派（第 2 节展开） |
+
+**返回链是往回走的**，第 39 步的返回值一路冒泡回 TUI：
+
+```text
+39 返回 (Arc<Session>, SessionIo)
+  → 36  组装成 NewThread（core/src/thread_manager.rs:172）
+    → 34  原样返回
+      → 15  app-server 的 thread_start_task 拿到 NewThread，构造 ThreadStartResponse
+        → 27  TUI 的 request_thread_start_with_history_fallback 收到响应
+```
+
+中间只在第 36 步换过一次类型：
 
 ```rust
 pub struct NewThread {
     pub thread_id: ThreadId,
-    pub thread: Arc<CodexThread>,
+    pub thread: Arc<CodexThread>,        // ← 注意不是 Arc<Session>
     pub session_configured: SessionConfiguredEvent,
 }
 ```
 
-**注意返回的是 `Arc<CodexThread>`，不是 `Arc<Session>`**——对外契约和内部运行时是分开的，
-见下面的 ③。`thread_id` 在这里被单独拎出来，是因为它才是持久句柄。
+**外部拿到的是 `Arc<CodexThread>`，不是 `Arc<Session>`**——对外契约和内部运行时是分开的，
+见 ③a。`thread_id` 被单独拎出来，是因为它才是持久句柄。
 
 #### 两个容易踩的坑
 
@@ -223,7 +286,7 @@ pub struct NewThread {
 
 ### ③ 关键设计
 
-#### a. 两个身份，两条生命周期
+#### a. 四个层次，四种生命周期
 
 | | `ThreadId` / `CodexThread` | `Session` |
 |---|---|---|
@@ -248,6 +311,52 @@ pub struct CodexThread {
 }
 ```
 
+把后面几节会出现的东西一起放进来，一共四个层次，**粒度依次递减，换下一个不会换上一个**：
+
+```text
+ThreadId        持久：磁盘上的 rollout 文件，跨进程存在
+   └─ Session   每次加载一个：一个进程里的一次实例化
+        ├─ services / state     会话级，跨多个 turn 存活
+        └─ active_turn          每轮换
+             └─ task            每轮换（与 turn 基本等价，第 2 节展开）
+```
+
+两个结论各自有代码依据。
+
+**① 换 task 不换 `Session`。** `spawn_task` 只动 `active_turn` 字段：
+
+```rust
+self.abort_all_tasks(TurnAbortReason::Replaced).await;   // 清掉旧 task
+self.clear_connector_selection().await;
+self.start_task(turn_context, input, task).await;        // 装上新 task
+```
+
+而 `abort_all_tasks` 最后调的是 `take_active_turn`，里面只有一句 `active.take()`——
+置空的是 `active_turn`，`Session` 对象本身没动。
+
+反过来说更清楚：如果 `Session` 跟着 task 换，那 `SessionServices` 里的东西（MCP 长连接、
+rollout writer、扩展的会话级状态、模型的 WebSocket）每轮都要重建。**`Session` 存在的意义
+就是承载这些跨 turn 复用的东西。**
+
+**② thread 和 `Session` 的生命周期并不一致。** thread 是持久实体，`Session` 只是它的
+一次实例化：
+
+| 事件 | thread | `Session` |
+|---|---|---|
+| 新建会话 | 新建 | 新建 |
+| 换 turn / 压缩 | 不变 | **不变** |
+| 进程退出（embedded） | 停止运行（文件还在） | **析构** |
+| `codex resume` | **同一条**（同一个 `ThreadId`） | **新建** |
+| `codex fork` | **新建** | 新建 |
+
+`resume` 那一行是关键：**同一个 `ThreadId`，新的 `Session`**。这正是
+`ThreadLifecycleContributor::on_thread_resume` 存在的原因——扩展要在新 `Session` 上
+重新水合自己的状态（第三幕 §9 会讲）。
+
+所以准确的说法是：**`Session` 是 thread 在某一个进程里的一次实例化。一个 thread 一生可以有
+多个 `Session`，但任一时刻最多一个**——由第零幕那条"同一个 `CODEX_HOME` 只能有一个 owner"
+的约束保证。
+
 #### b. `Session` 的边界由它自己的注释定义
 
 ```rust
@@ -267,6 +376,31 @@ pub(crate) struct Session {
 
 - **同时最多一个 task** → 决定了 turn 的并发模型（第 2 节）
 - **可被用户输入打断** → 决定了 `input_queue` 和 steer 机制的存在
+
+**"at most 1" 是上限，不是恒等式。** 展开字段看是两层 `Option`：
+
+```rust
+pub(crate) struct Session {
+    ...
+    pub(crate) active_turn: Mutex<Option<ActiveTurn>>,   // 第一层：可能整个会话空闲
+}
+
+pub(crate) struct ActiveTurn {
+    pub(crate) task: Option<RunningTask>,                // 第二层：有 turn 但没在跑
+    pub(crate) turn_state: Arc<Mutex<TurnState>>,
+}
+```
+
+于是有三种状态：
+
+| 状态 | `active_turn` | `.task` |
+|---|---|---|
+| 完全空闲 | `None` | — |
+| 有 turn，正在跑 | `Some` | `Some` |
+| 有 turn，正在收尾 | `Some` | `None` |
+
+**这条不变量是靠机制维持的，不是靠调用方自觉**：`spawn_task` 的第一件事就是
+`abort_all_tasks(TurnAbortReason::Replaced)`（第 2 节展开）。
 
 另有一条约束藏在字段注释里：
 
@@ -303,7 +437,7 @@ submission_loop(session_for_loop, configured_config, rx_sub)
 
 这是整个 agent 的心跳：所有 `Op` 都在这里被消费、分派到对应的 task。
 
-顺带一个细节：`INITIAL_SUBMIT_ID = ""`（`core/src/session/mod.rs:503`）——
+另一个细节：`INITIAL_SUBMIT_ID = ""`（`core/src/session/mod.rs:503`）——
 空字符串表示"不是由某次提交触发的事件"，比如启动期的警告。
 
 #### d. `SessionServices`：一次性注入的依赖容器
@@ -374,13 +508,13 @@ let base_instructions = config
 
 **总的代价：命名债。**
 
-用户说 "session"，代码里叫 thread；而代码里又真的存在一个叫 `Session` 的东西，但它是运行时。
-这个歧义是历史遗留（thread 曾经叫 conversation），
+用户界面上的 "session"、代码里的 thread、以及代码里另一个叫 `Session` 的运行时对象，
+三者指的是不同东西。这个歧义是历史遗留（thread 曾经叫 conversation），
 `codex-agent-architecture.md` 第 11 节专门做了对照表。
 
 ### 建议的阅读顺序
 
-如果你想自己过一遍代码，按这个顺序最省事：
+按这个顺序过一遍代码最省事：
 
 0. `cli/src/main.rs:143` 的 `Subcommand` 枚举 —— 先看这个程序能扮演哪些角色
 1. `core/src/session/session.rs` —— 只看 `Session` 结构体及其文档注释（建立边界感）
@@ -393,185 +527,416 @@ let base_instructions = config
 
 ## 2. turn 生命周期
 
-### ① 问题
+本节分三部分：
 
-什么算"一次 turn"？什么时候算结束？用户中途插话会发生什么？
+1. **turn 是什么** —— 定义、在全局中的位置、谁在维护它、生命周期、上下游交互
+2. **turn 怎么从 TUI 产生** —— 以及它怎么和 app-server、core 里的 turn 对应上
+3. **core 怎么处理它** —— 三层循环、结束判定、超限压缩、形态与中断
 
-第 1 节确立了 turn 的边界（一个 thread 同时最多一个 task）。
-这一节把它展开：**一次用户提交**是怎么变成"零次或多次模型请求"的，以及它在哪里收敛。
+---
 
-（第 3 节"模型接入"讲的是**单次请求**怎么发出去；那是这条链的下游，不在这里展开。）
+### ① turn 是什么
 
-具体是四个问题：
+#### a. 定义
 
-1. 什么算一次 turn？边界在哪里？
-2. 什么条件下它**结束**？
-3. 用户在中途又敲了一句话，会发生什么？
-4. 上下文快满了——是结束 turn，还是别的手段？
+"turn" 在第 1 节里露过面，但**从未定义**——那里的 `Session` 注释提到 "at most 1 running task"，
+调用链也只走到 `thread/start`，没有进入 turn 内部。
 
-第 4 个问题的答案会让人意外：**不结束**，压缩之后继续同一个 turn。
+> **一次 turn = 一次用户提交所触发的全部工作。**
+> 从输入被接受开始，到模型不再要求继续（既没有新的工具调用，也没有待处理输入）为止。
+> **一次 turn 内部可以包含多次模型请求。**
 
-### ② 代码入口
+"可以包含多次模型请求"这一条是定义里最容易被忽略的部分：模型要求工具调用时，执行完要把
+结果发回去再问一轮，这些都发生在同一个 turn 内。
+
+#### b. 它在全局的位置
+
+第 1 节 ③a 给过四层嵌套，turn 是最里面那一层：
 
 ```text
-codex-rs/protocol/src/turn_input.rs                          # TurnInput / TurnInputMode / Submission 结果类型
-codex-rs/core/src/state/turn.rs:32                           # ActiveTurn
-codex-rs/core/src/state/turn.rs:86                           # TurnState（turn 级可变状态）
-codex-rs/core/src/state/turn.rs:72                           # RunningTask
-codex-rs/core/src/session/submission.rs                      # Submission（Op + 归属信息）
-codex-rs/core/src/session/handlers.rs                        # submission_loop：所有 Op 的总入口
-codex-rs/core/src/session/turn_input.rs:299                  # start_or_steer：开始 / 插话 / 拒绝的判定
-codex-rs/core/src/tasks/mod.rs:180                           # SessionTask trait
-codex-rs/core/src/tasks/mod.rs:272                           # spawn_task / start_task
-codex-rs/core/src/tasks/mod.rs:630                           # on_task_finished
-codex-rs/core/src/tasks/regular.rs:35                        # RegularTask::run（任务级循环）
-codex-rs/core/src/session/turn.rs:163                        # run_turn（turn 级循环）
-codex-rs/core/src/session/turn.rs:1618                       # run_sampling_request（采样级循环）
-codex-rs/core/src/session/turn_context.rs:305                # TurnContext
-codex-rs/core/src/session/step_context.rs                    # StepContext
+ThreadId        持久：磁盘上的 rollout 文件，跨进程存在
+   └─ Session   每次加载一个：一个进程里的一次实例化
+        ├─ services / state     会话级，跨多个 turn 存活
+        └─ active_turn          每轮换
+             └─ task            每轮换
 ```
 
-### ③ 关键设计
+`task` 和 `turn` **不是同义词，但基本一一对应**：task 是 turn 的运行载体，一个 turn 由一个
+task 执行。两者只在两处有偏差：
 
-#### a. 四层嵌套的循环
+- **一个 task 内部可能跑多次 `run_turn`**（同一个 `turn_id`），见 ③a；
+- **`TaskKind::Compact` / `Review` 从 turn 视角看也是 turn**，只是换了 task 实现，见 ③d。
 
-这是本节的主线。从最外层到最内层：
+| | turn | task |
+|---|---|---|
+| 是什么 | **逻辑单位**：一次提交 → 最终答复 | **运行时单位**：跑在 tokio 后台任务上的 future |
+| 标识 | `turn_id`（即 `TurnContext.sub_id`） | `Arc<dyn AnySessionTask>` + `AbortOnDropHandle` |
+| 分类 | — | `TaskKind::{Regular, Review, Compact}`（`state/turn.rs:68`） |
+
+#### c. 谁在维护它
+
+四个结构，按存活范围从大到小：
+
+| 结构 | 位置 | 存活范围 | 装什么 |
+|---|---|---|---|
+| `TurnContext` | `session/turn_context.rs:305` | 整个 turn | turn 级配置、`terminal_error`、插件选择、extension data |
+| `TurnState` | `state/turn.rs:89` | 整个 turn | **可变**状态：待审批、待提问、tool 调用计数、token 用量 |
+| `StepContext` | `session/step_context.rs` | **单次采样请求** | 模型、工具表、MCP 绑定、AGENTS.md、环境快照 |
+| `RunningTask` | `state/turn.rs:74` | 整个 turn | 取消令牌、事件句柄、`Arc<TurnContext>`、若干 RAII 守卫 |
+
+前两个是"turn 知道什么"，第四个是"turn 在运行时握着什么"。三者之间有一句关键约束，
+写在 `TurnContext` 里：
+
+> Call state at turn creation; model requests use the `StepContext` snapshot.
+
+也就是：**turn 级的设置可以被中途改，但已经发出去的请求用当时快照的那一份**。
+
+`StepContext` 的模块注释把它的定位说得更直接：
+
+> Request-scoped settings and capabilities, including the durable context snapshot.
+
+这四者挂在哪？`Session` 上的一个字段：
+
+```rust
+pub(crate) struct Session {
+    ...
+    pub(crate) active_turn: Mutex<Option<ActiveTurn>>,   // 第一层：可能整个会话空闲
+}
+
+pub(crate) struct ActiveTurn {
+    pub(crate) task: Option<RunningTask>,                // 第二层：有 turn 但没在跑
+    pub(crate) turn_state: Arc<Mutex<TurnState>>,
+}
+```
+
+`RunningTask` 的字段值得看一眼，它展示了"一个 turn 运行时握着什么"：
+
+```rust
+pub(crate) struct RunningTask {
+    pub(crate) done: Arc<Notify>,
+    pub(crate) kind: TaskKind,
+    pub(crate) task: Arc<dyn AnySessionTask>,
+    pub(crate) cancellation_token: CancellationToken,
+    pub(crate) handle: AbortOnDropHandle<()>,
+    pub(crate) turn_context: Arc<TurnContext>,
+    pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
+    pub(crate) _diagnostics_guard: GaugeGuard,
+    pub(crate) _timer: Option<codex_otel::Timer>,
+}
+```
+
+最后那个 `_timer` 的注释写着"记录在 task drop 时的完整时长"——又一次 RAII 计时。
+
+**"at most 1 running task" 是上限，不是恒等式**（第 1 节 ③b 已展开）：两层 `Option` 对应
+三种状态——完全空闲 / 有 turn 且正在跑 / 有 turn 正在收尾。
+
+#### d. 生命周期：五个阶段
 
 ```text
-submission_loop                      session/handlers.rs
-  消费 Op，分派到具体处理函数
-    │
-    └─ RegularTask::run              tasks/regular.rs:35
-         loop {                      ← ① 任务级：处理"上一轮收尾后又有输入"
-           run_turn                  turn.rs:163
-             loop {                  ← ② turn 级：模型 ↔ 工具循环
-               drain pending input   （steer 在这里被吸收）
-               run_sampling_request  turn.rs:1618
-                 loop { ... }        ← ③ 采样级：单个请求 + 流式重试
-               if needs_follow_up { continue }
-               else { stop hooks; return }
-             }
-           if !input_queue.has_pending_input { return }
-           next_input = vec![]
-         }
+产生   start_or_steer → spawn_task                     （② 展开）
+运转   RegularTask::run → run_turn 循环                （③a 展开）
+收敛   needs_follow_up 为假 → 跑 Stop hook             （③b 展开）
+收尾   on_task_finished（tasks/mod.rs:630）→ 发事件 + 落盘
+销毁   RunningTask drop → turn_store 丢弃，turn 结束
+```
+
+「收尾」这一步的 `on_task_finished` 负责三件事：把 `TurnCompleteEvent` 或 `TurnAbortedEvent`
+发给客户端、落盘最后的历史、清掉 `active_turn`。「销毁」不需要显式代码——`turn_store` 是跟着
+turn 走的 `ExtensionData`，`RunningTask` 一 drop 它就没人引用了。
+
+#### e. 上下游交互
+
+把 turn 放在数据流中间看，它同时被上游驱动、又驱动下游：
+
+```text
+上游（谁给 turn 送东西）
+  ├─ 用户输入        turn/start → Op::TurnInput
+  ├─ 中途插话        turn/steer → 折进当前 turn（steer）
+  ├─ 子 agent 消息   Op::InterAgentCommunication
+  ├─ hook 注入        UserPromptSubmit / PostToolUse 的 additionalContext
+  └─ 工具结果回灌      FunctionCallOutput
+
+turn（本文主角）
+
+下游（turn 驱动谁）
+  ├─ 模型请求        run_sampling_request → ModelClient（第 3 节）
+  ├─ 工具执行        ToolCallRuntime（第二幕）
+  ├─ 持久化          rollout / world state / TurnContextItem
+  └─ 事件流          Event → app-server → TUI
+```
+
+这张图里有两个方向都存在的通道：**`Op` 进、`Event` 出**（第 1 节 ③c）。
+
+---
+
+### ② turn 怎么产生：从 TUI 到 core
+
+TUI 里有六个会产生 turn 的入口，但它们**全部汇聚到同一个出口**：
+
+```text
+[场景 1] 输入框回车          composer → submit_user_message
+[场景 2] 排队消息被派发       maybe_send_next_queued_input → slash_dispatch 的 drain 分支
+[场景 3] 斜杠命令自带提示词    /init 等 → submit_user_message(INIT_PROMPT)
+[场景 4] 启动时的初始提示      codex "..." → ChatWidgetInit.initial_user_message
+[场景 5] 失败恢复 / 重试       input_restore.rs:180
+[场景 6] 带协作模式的提交      AppEvent::SubmitUserMessageWithMode
+        │
+        │  六个入口构造的是同一个东西：Op::UserTurn { items, cwd, model, ... }
+        ▼
+chatwidget::submit_op(op)                                    chatwidget.rs:1809
+        │  按 codex_op_target 分流（两个目标）
+        ├─ CodexOpTarget::Direct(tx)  → tx.send(op)             # 旧路径
+        └─ CodexOpTarget::AppEvent    → AppEvent::CodexOp(op)   # 现路径
+              │
+              ▼
+try_submit_active_thread_op_via_app_server(app_server, thread_id, &op)
+    tui/src/app/thread_routing.rs:659
+        │  match op { Interrupt => …, UserTurn { .. } => … }
+        ▼
+AppCommand::UserTurn { .. } 分支                              thread_routing.rs:736
+        │
+        ▼
+app_server.turn_start(thread_id, client_user_message_id, items, cwd, …)
+    tui/src/app_server_session.rs:1288                        thread_routing.rs:874
+```
+
+三个关键点：
+
+1. **`app_server.turn_start` 在整个 TUI 里只有一个调用点**（`thread_routing.rs:874`）。
+   六个入口、一个出口。
+2. **六个入口构造的是同一个东西**：`Op::UserTurn`。区别只在 `items`、`cwd`、
+   `collaboration_mode` 这些字段怎么填。
+3. **`submit_op` 有两个目标**（`chatwidget.rs:1836`）：`Direct` 是旧路径直接写通道，
+   `AppEvent` 是现在的路径——交给 app 层统一处理。所以下面的链从 `AppEvent` 开始。
+
+#### a. 六个入口分别是什么
+
+| # | 触发方式 | 入口 | 说明 |
+|---|---|---|---|
+| 1 | 输入框回车 | `chatwidget/input_submission.rs` 的 `submit_user_message*` | 主路径 |
+| 2 | 排队消息被派发 | `chatwidget/slash_dispatch.rs:1095` 一带 | 上一轮在跑时提交的消息会排队，空闲后逐条派发 |
+| 3 | 斜杠命令自带提示词 | `slash_dispatch.rs:292`（`/init`）等 | 命令自己构造提示词再走提交 |
+| 4 | 启动时的初始提示 | `codex "帮我修一下这个 bug"` | 参数进 `ChatWidgetInit.initial_user_message`，**先排队**，会话配置好后走场景 2 的派发 |
+| 5 | 失败后恢复 | `chatwidget/input_restore.rs:180` | 把用户消息恢复并重新提交 |
+| 6 | 指定协作模式的提交 | `app/event_dispatch.rs:2995` 的 `AppEvent::SubmitUserMessageWithMode` | 例如从 Plan 模式确认后提交 |
+
+场景 1 是主路径，其余五个都是"绕过键盘但走同一条路"。`AppCommand` 里还有 `Review` /
+`Compact` 等分支，它们也在同一个 match 里分流，但语义不是"用户提交一句话"，所以没列进来。
+
+#### b. 从 `turn_start` 往下：跨进程到 core
+
+第 1 节的链在第 39 步（`Session::spawn_internal`）把 thread 建起来，返回值一路冒泡回 TUI。
+本节从那里接着走——**一句话从 TUI 出发之后发生了什么**：
+
+```text
+40. tui/src/app_server_session.rs:1288        AppServerSession::turn_start
+41. tui/src/app_server_session.rs:1310          request_typed(ClientRequest::TurnStart { .. })
+      ═══════ 跨进程边界（embedded 时同进程；daemon 时是 unix socket）═══════
+42. app-server/src/message_processor.rs:1629   ClientRequest::TurnStart { .. } => ...
+43. app-server/src/request_processors/turn_processor.rs:174   TurnProcessor::turn_start
+44. app-server/src/request_processors/turn_processor.rs:522   turn_start_inner
+45. app-server/src/request_processors/turn_processor.rs:652     thread.start_or_steer_turn(...)
+46. core/src/codex_thread.rs:378                CodexThread::start_or_steer_turn
+47. core/src/codex_thread.rs:533                  submit_turn_input_with_mode
+48. core/src/session/mod.rs:1001                   SessionIo::submit_turn_input    # 生成 turn_id、装 Submission
+49. core/src/session/mod.rs:990                      tx_sub.send(sub).await       # ← 写进队列
+      ═══════ 进提交队列：第 1 节 ③c 讲过的 SessionIo.tx_sub，容量 512 ═══════
+50. core/src/session/handlers.rs:427            submission_loop：rx_sub.recv()   # ← 从同一个队列取出
+51. core/src/session/turn_input.rs:211           turn_input::handle
+52. core/src/session/turn_input.rs:299             start_or_steer
+53. core/src/tasks/mod.rs:272                        spawn_task         # ← turn 在这里诞生
+54. core/src/tasks/mod.rs:287                          start_task
+55. core/src/tasks/regular.rs:40                         RegularTask::run # ← 进入 turn 内部
+56. core/src/session/turn.rs:163                           run_turn
+57. core/src/session/turn.rs:1618                            run_sampling_request   # ← 交给第 3 节
+```
+
+五处值得注意的衔接：
+
+- **第 41 → 42 步是进程边界**。embedded 下它只是函数调用，daemon 下是 unix socket 上的
+  JSON-RPC——但两边看到的方法名完全相同，"服务端在哪"不影响这条链的形状（第 1 节 ③a）。
+- **第 48 → 49 步是"装信封 → 入队"**：`submit_turn_input`（`mod.rs:1001`）只做三件事——
+  生成 `turn_id`、建 oneshot、把 `Op::TurnInput` 包成 `Submission`；真正的 `send` 在下一层
+  `submit_with_id`（`mod.rs:986`）里。顺带一提，`send` 前它会补上 W3C trace：
+
+  ```rust
+  pub(crate) async fn submit_with_id(&self, mut sub: Submission) -> CodexResult<()> {
+      if sub.trace.is_none() {
+          sub.trace = current_span_w3c_trace_context();
+      }
+      self.tx_sub.send(sub).await.map_err(|_| CodexErr::InternalAgentDied)?;
+      Ok(())
+  }
+  ```
+
+  **`tx_sub` 就是第 1 节 ③c 里那个 `SessionIo.tx_sub: Sender<Submission>`，队列在
+  `mod.rs:586` 用 `async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY)` 建出来，容量 512。**
+  所以第 49 步和第 50 步是**同一个队列的写端和读端**——第 49 步 `send`，第 50 步 `recv`。
+  因为是 bounded 队列，队列满时 `send().await` 会等，这就是背压。
+- **第 48 → 50 步之间是异步的**：`submit_turn_input` 入队后 `await` 一个 oneshot 回执
+  （`core/src/session/mod.rs:1022` 的 `reply_rx.await`），`submission_loop` 处理完再把结果
+  写回这个 oneshot。**所以第 43 步之后的 `turn_start` 是"发出去等回话"，不是"直接调用"。**
+- **第 52 → 53 → 55 步是"turn 诞生"的三拍**，值得展开：
+
+  **第一拍（52 → 53，`spawn_task`）** —— 只做两件准备工作，然后转发：
+
+  ```rust
+  pub async fn spawn_task<T: SessionTask>(self: &Arc<Self>, turn_context, input, task) {
+      self.abort_all_tasks(TurnAbortReason::Replaced).await;   // ① 先中止上一个 turn
+      self.clear_connector_selection().await;                  // ② 清掉上一轮的 connector 选择
+      self.start_task(turn_context, input, task).await;        // ③ 转发
+  }
+  ```
+
+  第 ① 行就是"一个 thread 同时只有一个 turn"那条不变量的实现位置（③d 会再提一次）。
+
+  **第二拍（53 → 54，`start_task` 前半段）** —— `ActiveTurn` 在这里被创建，但 `task` 还是空：
+
+  ```rust
+  let mut active = self.active_turn.lock().await;
+  let turn = active.get_or_insert_with(ActiveTurn::default);   // ← active_turn 诞生
+  debug_assert!(turn.task.is_none());
+  ```
+
+  接着它会建 `CancellationToken`、记下 `token_usage_at_turn_start`、把排队的 mailbox 消息
+  塞进 `turn_state`，并跑一次 `TurnStartPhase::BeforeTaskRegistration` 的扩展 lifecycle。
+
+  **第三拍（54 → 55，`start_task` 收尾）** —— 关键在这里：`task.run(...)` **不是被直接调用**，
+  而是包进一个 future 交给 `tokio::spawn`：
+
+  ```rust
+  let task_future = async move {
+      let task_result = task_for_run.run(Arc::clone(&session), ctx, task_input, token).await;
+      ...
+      sess.on_task_finished(Arc::clone(&ctx_for_finish), task_result).await;
+      done_clone.notify_waiters();
+  };
+  let handle = tokio::spawn(storage_originator.scope(task_future));   // ← 另起一个 tokio task
+  ...
+  turn.task = Some(RunningTask { done, handle, kind, task, cancellation_token, ... });  // ← turn 诞生
+  ```
+
+  **"turn 诞生"的准确时刻就是最后那一行 `turn.task = Some(...)`**：`active_turn.task` 从
+  `None` 变成 `Some`，而与此同时后台的 `RegularTask::run` 已经被 spawn 出去了。
+
+  这同时解释了 54 → 55 为什么看起来是"跳"的——**它跨到了一个全新的 tokio task，
+  不是同一条调用栈**。`spawn_task(...).await` 返回时，`RegularTask::run` 可能刚开始跑、
+  也可能还没被调度。第 55 步往下的整条链都发生在那条新的 tokio task 上。
+
+  （还有一处呼应：`start_task` 里发的是 `TurnStartPhase::BeforeTaskRegistration`，
+  而 `RegularTask::run` 内部还会再发一次 `TurnStartPhase::RegularTaskStart`——
+  这就是第零幕 `TurnStartPhase` 两个取值的实际用途。）
+
+- **第 57 步交给第 3 节**：`run_sampling_request` 内部就是"发模型请求"。
+
+#### c. 三层身份怎么对应
+
+这条链上出现过好几个 ID，容易以为是不同的东西。实际上它们**是同一个值**：
+
+```text
+core/src/session/mod.rs:1006     let id = new_submission_id();     ← 唯一一次生成
+                                        │
+                                        ├─ Submission.id
+                                        ├─ TurnInputSubmission::Started { turn_id }   （返回给调用方）
+                                        ├─ TurnContext.sub_id                          （turn 的运行身份）
+                                        └─ Event.id                                    （所有事件的归属）
+```
+
+四个名字指的是一回事：**`turn_id == submission_id == TurnContext.sub_id == Event.id`**。
+
+`new_submission_id()` 用的是 UUIDv7，实现里留了一句警告：
+
+> Some use cases take advantage of the fact that these are UUID7 which encodes a timestamp,
+> so think carefully before changing this.
+
+——因为时间有序，它可以当排序键用（比如事件按 turn 排序）。
+
+TUI 侧还有一个名字：`client_user_message_id`。它不是 turn 身份，而是**用来去重的**——
+客户端重发同一条消息时靠它识别。两者别混。
+
+#### d. 谁决定"开始 / 插话 / 拒绝"
+
+第 51 步的 `start_or_steer`（`session/turn_input.rs:299`）是 Core 里唯一的判定点，
+模块注释写得很明确：
+
+> This is the one place Core decides whether submitted input starts a turn, steers an active turn,
+> or is rejected.
+
+逻辑是**先试 steer，失败再试 start**：
+
+```rust
+match session.steer_input(&mut input, ..., /*expected_turn_id*/ None, ...).await {
+    Ok(turn_id) => { /* 插话成功 */ TurnInputSubmission::Steered { turn_id } }
+    Err(NotSubmittedReason::NoActiveTurn) => {
+        // 走到这里说明没有活跃 turn，考虑启动
+        let _admission = session.services.extensions.admit_turn_start();  // 准入门
+        let turn_context = settings.apply_started(session, submission_id, TurnStartKind::User).await?;
+        session.spawn_task(turn_context, task_input, RegularTask::new()).await;
+        TurnInputSubmission::Started { turn_id: submission_id }
+    }
+    Err(reason) => TurnInputSubmission::NotSubmitted { reason }
+}
+```
+
+三个设计细节：
+
+- **`steer_input` 先跑**，所以"插话"不需要额外判断活跃状态，一次调用就分流了。
+- **准入门**（`admit_turn_start()`）在启动分支里。拿不到许可就是
+  `NotSubmittedReason::ServerDraining`——host 正在关闭时不再接新 turn。
+- **父代理委派的输入绕过准入门**（`is_delegated_input`），因为子 agent 的输入属于
+  父级已有的工作，不是新会话。
+
+协议层还提供了四种模式（`protocol/src/turn_input.rs:133`），让调用方表达意图：
+
+| `TurnInputMode` | 语义 |
+|---|---|
+| `StartOrSteer` | 空闲就开新 turn，否则插话（默认） |
+| `StartIfIdle` | 只在空闲时开始，否则拒绝 |
+| `ContinueIfIdle { expected_previous_turn_id }` | 空闲才继续；如果这期间有别的 task 启动过就拒绝 |
+| `Steer { expected_turn_id }` | 只对指定 turn 插话 |
+
+`start_or_steer` 走到最后一步是 `spawn_task(...)`——**turn 就是在这一行诞生的**。
+### ③ core 怎么处理 turn
+
+turn 一旦诞生，`RegularTask::run` 就跑起来。从它往里看是三层嵌套：
+
+#### a. 三层嵌套的循环
+
+```text
+RegularTask::run                     tasks/regular.rs:40
+  loop {                             ← 任务级：处理"上一轮收尾后又有输入"
+    run_turn                         turn.rs:163
+      loop {                         ← turn 级：模型 ↔ 工具循环
+        drain pending input          （steer 在这里被吸收）
+        run_sampling_request         turn.rs:1618
+          loop { ... }               ← 采样级：单个请求 + 流式重试
+        if needs_follow_up { continue }
+        else { stop hooks; return }
+      }
+    if !input_queue.has_pending_input { return }
+    next_input = vec![]
+  }
 ```
 
 三层循环各自解决不同的问题，混在一起看必然迷糊：
 
 | 循环 | 位置 | 解决什么 |
 |---|---|---|
-| ② turn 级 | `run_turn` | **模型要求工具调用** → 执行 → 再问一次模型 |
-| ③ 采样级 | `run_sampling_request` | **同一个请求的流式重试**（网络抖动、断流） |
-| ① 任务级 | `RegularTask::run` | **收尾之后又来了输入** → 在同一个 task 里再开一个 `run_turn` |
+| **turn 级** | `run_turn` | **模型要求工具调用** → 执行 → 再问一次模型 |
+| **采样级** | `run_sampling_request` | **同一个请求的流式重试**（网络抖动、断流） |
+| **任务级** | `RegularTask::run` | **收尾之后又来了输入** → 在同一个 task 里再开一个 `run_turn` |
 
-注意 ② 和 ① 都在处理"还有输入"，区别在时机：②处理的是 **turn 进行中**到达的输入（steer），
-①处理的是 `run_turn` 刚刚收敛、**task 尚未返回**这个极窄窗口里到达的输入。
-如果输入晚于 task 返回才到，两条路都不会走——而是开一个全新的 turn。详见 b。
+注意 **turn 级**和**任务级**都在处理"还有输入"，区别在时机：turn 级处理的是
+**turn 进行中**到达的输入（steer），任务级处理的是 `run_turn` 刚刚收敛、
+**task 尚未返回**这个极窄窗口里到达的输入。如果输入晚于 task 返回才到，两条路都不会走——
+而是再走一次 ② 的产生流程，开一个全新的 turn。
 
-#### b. task 与 turn 的关系
+**任务级**循环还有一处容易看漏：第二圈跑 `run_turn` 时传的是 `next_input = Vec::new()`
+——因为新输入已经被第一圈通过 `input_queue` 吸收掉了。不写出来会以为它在重复消费输入。
 
-上面那张图里同时出现了 "task" 和 "turn" 两个词，它们**不是同义词**，这里必须说清楚，
-否则后面所有关于"最多一个"的说法都会含糊。
+#### b. turn 什么时候算结束
 
-**一句话：task 是 turn 的运行载体。** 一个 turn 由一个 task 执行；task 有类型，
-类型对应 turn 的类型。
-
-| | turn | task |
-|---|---|---|
-| 是什么 | **逻辑单位**：一次提交 → 最终答复 | **运行时单位**：跑在 tokio 后台任务上的 future |
-| 标识 | `turn_id`（即 `TurnContext.sub_id`） | `Arc<dyn AnySessionTask>` + `AbortOnDropHandle` |
-| 生命周期 | 从被 admit 到收尾 | 从 `spawn_task` 到 future 返回或被 abort |
-| 分类 | — | `TaskKind::{Regular, Review, Compact}`（`state/turn.rs:67`） |
-
-##### 为什么注释里说的是 "task"
-
-`Session` 的文档注释讲的是**运行时并发不变量**：
-
-```rust
-/// A session has at most 1 running task at a time, and can be interrupted by user input.
-```
-
-在 `Session` 这一层，被管理的东西就是 `RunningTask`：
-
-```rust
-pub(crate) struct ActiveTurn {
-    pub(crate) task: Option<RunningTask>,      // ← 最多一个
-    pub(crate) turn_state: Arc<Mutex<TurnState>>,
-}
-```
-
-所以这句话想说明三件事：
-
-1. **同一个 thread 上不可能同时跑两个 turn** —— 不能一边 review 一边聊天。
-2. **新工作不是排队，是抢占**（`tasks/mod.rs:272`）：
-
-   ```rust
-   pub async fn spawn_task<T: SessionTask>(...) {
-       self.abort_all_tasks(TurnAbortReason::Replaced).await;   // ← 先中止旧的
-       self.clear_connector_selection().await;
-       self.start_task(turn_context, input, task).await;
-   }
-   ```
-
-   注意还有一条**不 abort** 的路径：`start_task`（`:287`）本身不做中止，
-   给已经确认空闲的调用方用（例如 `maybe_start_turn_for_pending_work_with_sub_id`，`:452`）。
-   两条路合起来维持"最多一个"的不变量。
-3. **为什么必须这样**：thread 只有一份共享可变历史（`ContextManager`），
-   rollout 也是单一追加流。两个 task 并行会互相踩。
-
-##### 两处 task ≠ turn
-
-**偏差一：一个 task 内部可能跑多次 `run_turn`。**
-
-`RegularTask::run`（`tasks/regular.rs:35`）自己有个循环：
-
-```rust
-loop {
-    run_turn(Arc::clone(&ctx), ...)      // ← 同一个 ctx，turn_id 不变
-    if ctx.terminal_error.lock().await.is_some() { return }
-    if !sess.input_queue.has_pending_input(&sess.active_turn).await { return }
-    next_input = Vec::new();
-}
-```
-
-`ctx` 是同一个 `Arc<TurnContext>`，所以 **turn_id 不变**——这是同一次 turn 里的第二轮
-`run_turn`。
-
-**偏差二：`Compact` 和 `Review` 也是 turn。**
-
-`session/handlers.rs:251`（压缩）和 `session/review.rs:218`（审查）都是走 `spawn_task`，
-各自带了 `TurnContext`（有自己的 turn id）。所以"一次压缩"从 turn 视角看**也是一次 turn**，
-只是换了 task 实现。
-
-##### 外层循环为什么存在
-
-因为 `run_turn` 的收敛判据是"**此刻**没有 pending input"。但从它做这个判断到 task 真正返回，
-中间有个窗口——输入可能刚好落进来。`RegularTask::run` 的循环就是关这个窗口的。
-
-按输入到达的时机区分：
-
-| 输入到达时机 | 结果 |
-|---|---|
-| turn 进行中 | `run_turn` 内部 drain → 折进这次 turn（steer） |
-| `run_turn` 刚收敛、task 未返回 | `RegularTask::run` 的循环 → **同一个 turn_id** 再跑一轮 |
-| task 返回之后 | `start_or_steer` 找不到 active turn → **新 task、新 turn_id** |
-
-##### 作者自己的措辞佐证
-
-`MailboxDeliveryPhase` 的注释用 "same task" 描述同一个逻辑单位（`state/turn.rs:45`）：
-
-> If the **same task** later gets explicit same-turn work again (a steered user prompt or a tool
-> call after an untagged preamble), we reopen `CurrentTurn`...
-
-`defer_mailbox_delivery_to_next_turn` 的注释更直接（`session/input_queue.rs:288`）：
-
-> keep it pending so **task completion records it for the next turn** without sampling again.
-
-——"task completion records it for the next turn"，说明作者心中的边界就是 **task 的边界**。
-
-#### c. turn 什么时候算结束
-
-判据只有一行（`turn.rs:558`）：
+判据只有一行（`turn.rs:566`）：
 
 ```rust
 let needs_follow_up = model_needs_follow_up || has_pending_input;
@@ -582,7 +947,7 @@ let needs_follow_up = model_needs_follow_up || has_pending_input;
 - `model_needs_follow_up` —— 来自采样结果。模型要求函数调用就为真
 - `has_pending_input` —— 来自 `input_queue.has_pending_input()`，即 steer 队列非空
 
-只有当**两者都为假**时才进入收尾分支（`turn.rs:620`）：
+只有当**两者都为假**时才进入收尾分支（`turn.rs:653`）：
 
 ```rust
 if !needs_follow_up {
@@ -600,7 +965,7 @@ if !needs_follow_up {
 > - If the model sends only an assistant message, we record it in the conversation history and
 >   consider the turn complete.
 
-#### d. token 超限时不结束 turn，而是插队压缩
+#### c. token 超限时不结束 turn，而是插队压缩
 
 这是最反直觉的一段（`turn.rs:601`）：
 
@@ -625,93 +990,12 @@ if should_roll_over {
 - 触发条件是 `needs_follow_up && token_limit_reached`——**只有还需要继续时**才压缩。
   如果模型已经答完了，超限与否都不影响收尾。
 - 用的是 `CompactionPhase::MidTurn` 和 `InitialContextInjection::BeforeLastUserMessage`，
-  和 pre-turn 压缩的策略不同（这也是第四幕要展开的点）。
+  和 pre-turn 压缩的策略不同（第四幕展开）。
 - `continue` 意味着**用户感知不到 turn 断过**。
 
-#### e. 谁决定"开始 turn / 插话 / 拒绝"
+#### d. turn 的形态与中断
 
-这是 Core 里唯一的判定点（`session/turn_input.rs:299`）——模块注释写得很明确：
-
-> This is the one place Core decides whether submitted input starts a turn, steers an active turn,
-> or is rejected.
-
-逻辑是**先试 steer，失败再试 start**：
-
-```rust
-match session.steer_input(&mut input, ..., /*expected_turn_id*/ None, ...).await {
-    Ok(turn_id) => { /* 插话成功 */ TurnInputSubmission::Steered { turn_id } }
-    Err(NotSubmittedReason::NoActiveTurn) => {
-        // 走到这里说明没有活跃 turn，考虑启动
-        let _admission = session.services.extensions.admit_turn_start();  // 准入门
-        let turn_context = settings.apply_started(...)?;
-        session.spawn_task(turn_context, task_input, RegularTask::new()).await;
-        TurnInputSubmission::Started { turn_id }
-    }
-    Err(reason) => TurnInputSubmission::NotSubmitted { reason }
-}
-```
-
-三个设计细节：
-
-- **`steer_input` 先跑**，所以"插话"不需要额外判断活跃状态，一次调用就分流了。
-- **准入门**（`admit_turn_start()`）在启动分支里。拿不到许可就是
-  `NotSubmittedReason::ServerDraining`——host 正在关闭时不再接新 turn。
-- **父代理委派的输入绕过准入门**（`is_delegated_input`），因为子 agent 的输入属于
-  父级已有的工作，不是新会话。
-
-另外协议层还提供了四种模式（`protocol/src/turn_input.rs:133`），让调用方表达意图：
-
-| `TurnInputMode` | 语义 |
-|---|---|
-| `StartOrSteer` | 空闲就开新 turn，否则插话（默认） |
-| `StartIfIdle` | 只在空闲时开始，否则拒绝 |
-| `ContinueIfIdle { expected_previous_turn_id }` | 空闲才继续；如果这期间有别的 task 启动过就拒绝 |
-| `Steer { expected_turn_id }` | 只对指定 turn 插话 |
-
-#### f. 三个状态容器，三个存活范围
-
-容易混，但边界很清楚：
-
-| 容器 | 位置 | 存活范围 | 装什么 |
-|---|---|---|---|
-| `TurnContext` | `session/turn_context.rs:305` | 整个 turn | turn 级配置、`terminal_error`、插件选择、extension data |
-| `TurnState` | `state/turn.rs:86` | 整个 turn | **可变**状态：待审批、待提问、tool 调用计数、token 用量 |
-| `StepContext` | `session/step_context.rs` | **单次采样请求** | 模型、工具表、MCP 绑定、AGENTS.md、环境快照 |
-
-`StepContext` 的设计意图写在它的模块注释里：
-
-> Request-scoped settings and capabilities, including the durable context snapshot.
-
-以及 `TurnContext` 里的一句提示，说明了为什么要有这一层：
-
-> Call state at turn creation; model requests use the `StepContext` snapshot.
-
-也就是：**turn 级的设置可以被中途改，但已经发出去的请求用当时快照的那一份。**
-
-上面三个容器是"turn 知道什么"。还有一层是"turn 在运行时**握着**什么"——
-`ActiveTurn` 只持有 `task` 和 `turn_state`（结构见 b），而 `task` 里的
-`RunningTask`（`state/turn.rs:72`）是长这样的：
-
-```rust
-pub(crate) struct RunningTask {
-    pub(crate) done: Arc<Notify>,
-    pub(crate) kind: TaskKind,
-    pub(crate) task: Arc<dyn AnySessionTask>,
-    pub(crate) cancellation_token: CancellationToken,
-    pub(crate) handle: AbortOnDropHandle<()>,
-    pub(crate) turn_context: Arc<TurnContext>,
-    pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
-    pub(crate) _diagnostics_guard: GaugeGuard,
-    pub(crate) _timer: Option<codex_otel::Timer>,
-}
-```
-
-注意最后那个 `_timer`：**它的注释写着"记录在 task drop 时的完整时长"**——
-又是 RAII 计时的例子。
-
-#### g. turn 的形态与中断
-
-`TaskKind` 有三个值（`state/turn.rs:67`）：`Regular` / `Review` / `Compact`。
+`TaskKind` 有三个值（`state/turn.rs:68`）：`Regular` / `Review` / `Compact`。
 
 注意 `user_shell.rs` 里那个任务（跑用户直接输入的命令，不走模型）报告的
 **也是 `TaskKind::Regular`**（`tasks/user_shell.rs:76`）——所以"有四个 task 实现，
@@ -738,9 +1022,15 @@ Op::Interrupt
 `Replaced` 这一条很关键：**`spawn_task` 的第一件事就是中止上一个 task**。
 这保证了"一个 thread 同时只有一个 turn"这条不变量不是靠调用方自觉，而是靠机制。
 
+（这里补一个第 1 节没提的细节：`start_task`（`tasks/mod.rs:287`）本身**不做**中止，
+给已经确认空闲的调用方用，例如 `maybe_start_turn_for_pending_work_with_sub_id`（`:452`）。
+两条路合起来才维持住"最多一个"。）
+
 任务的执行形态：后台 tokio task + `CancellationToken`（协作式取消）+
 `AbortOnDropHandle`（兜底强杀）。优雅中断的宽限期是
 `GRACEFULL_INTERRUPTION_TIMEOUT_MS = 100`（`tasks/mod.rs:71`）。
+
+---
 
 ### ④ 取舍
 
@@ -751,10 +1041,10 @@ Op::Interrupt
 
 代价是状态机复杂度上了一个台阶，具体体现在三处：
 
-- `needs_follow_up` 必须同时考虑模型意图和队列状态（`turn.rs:558`）
+- `needs_follow_up` 必须同时考虑模型意图和队列状态（`turn.rs:566`）
 - 需要"任务级循环"来覆盖"收尾之后又来了输入"这种情况（`RegularTask::run`）
 - 需要一个 `MailboxDeliveryPhase` 状态机来回答"这条消息还能不能塞进当前 turn"
-  （`state/turn.rs:48`，注释解释了 `CurrentTurn` / `NextTurn` 的切换时机）
+  （`state/turn.rs:49`，注释解释了 `CurrentTurn` / `NextTurn` 的切换时机）
 
 **为什么 turn 内允许多次模型请求，而不是一次调用就结束？**
 
@@ -774,11 +1064,13 @@ Op::Interrupt
 而且之前积累的上下文可能白费。`continue` 让压缩变成**实现细节**。
 
 代价是复杂度：压缩逻辑必须能在 turn 内部被调用，而且要处理"压缩本身也可能失败"
-（`turn.rs:601` 那段 error 分支里，失败时是 `emit_turn_error_lifecycle` 然后返回 `Ok(None)`，
+（`turn.rs:632` 那段 error 分支里，失败时是 `emit_turn_error_lifecycle` 然后返回 `Ok(None)`，
 不是 panic）。
 
----
+**为什么 `Session` 的那句注释说 "task" 而不是 "turn"？**
 
+因为那一层描述的是**运行时在跑什么**，被管理的东西就是 `RunningTask`。而因为一个 thread
+同时只允许一个 task，它等价于"同时只允许一个 turn"。更详细的读法在第 1 节 ③b。
 ## 3. 模型接入
 
 ### ① 问题
@@ -800,14 +1092,38 @@ Op::Interrupt
 
 ### ② 代码入口
 
+第 2 节的链在第 57 步（`run_sampling_request`）停下，那里正是"要发一次模型请求"的时刻。
+本节从那里接着走——**一个 `Prompt` 怎么变成网络上的字节，又怎么变回事件流**：
+
 ```text
-codex-rs/http-client/src/transport.rs                       # HttpTransport trait（真正发字节）
+57. core/src/session/turn.rs:1618             run_sampling_request          （第 2 节的终点）
+58. core/src/session/turn.rs:1684               try_run_sampling_request(...)
+59. core/src/session/turn.rs:2572                 client_session.stream(prompt, ...)
+60. core/src/client.rs:2226                    ModelClientSession::stream
+61. core/src/client.rs:2237                      match wire_api + responses_websocket_enabled()
+        ├─ 启用 WS  → core/src/client.rs:1842   stream_responses_websocket
+        └─ 否则     → core/src/client.rs:1651   stream_responses_api        # HTTP/SSE 分支
+62. core/src/client.rs:1182                          build_api_transport     -> ReqwestTransport
+63. core/src/client.rs:1765                          ApiResponsesClient::new(...).stream_request(...)
+64. codex-api/src/endpoint/responses.rs:61              ResponsesClient::stream_request
+65. codex-api/src/endpoint/session.rs:122                 EndpointSession::stream_encoded_json_with
+                                                            （套重试 + auth.apply_auth）
+66. http-client/src/transport.rs:41                     HttpTransport::stream()   # ← 真正发字节
+67. codex-api/src/sse/spawn_response_stream               解析 SSE 事件
+68. core/src/client.rs 的 map_response_stream             变回 ResponseStream，交还第 2 节
+```
+
+两处衔接：
+
+- **第 57 → 60 步仍在 core 内**，只是从 `session/turn.rs` 换到 `client.rs`——这条链到第 66 步才真正出网。
+- **第 61 步是 §3 后面 d 小节的分岔点**：走 WS 还是 HTTP，取决于 provider 能力与会话级的 fallback 状态。
+
+不在这条链上、但会被用到的部分：
+
+```text
 codex-rs/codex-client/src/{provider,retry,sse}.rs           # Provider 参数对象 + 重试策略
-codex-rs/codex-api/src/endpoint/responses.rs                # HTTP/SSE 推理端点
 codex-rs/codex-api/src/endpoint/responses_websocket.rs      # WebSocket 推理端点
-codex-rs/codex-api/src/endpoint/session.rs:122              # EndpointSession：套重试 + 注入鉴权
 codex-rs/codex-api/src/common.rs:279                        # ResponsesApiRequest / ResponseCreateWsRequest
-codex-rs/codex-api/src/sse/responses.rs                     # SSE 事件解析
 codex-rs/model-provider/src/{provider,auth,workspace_routing}.rs
 codex-rs/core/src/client.rs:265                             # ModelClient（会话级）
 codex-rs/core/src/client.rs:292                             # ModelClientSession（turn 级）
@@ -855,9 +1171,9 @@ core/src/client.rs:1765    ApiResponsesClient::new(transport, api_provider, api_
                              .stream_request(request, options)
   core/src/client.rs:1182    build_api_transport            -> ReqwestTransport
   codex-api/src/endpoint/responses.rs:61                   编码请求体、挂 header
-  codex-api/src/endpoint/session.rs:122                    run_with_request_telemetry：
+  codex-api/src/endpoint/session.rs:139                    run_with_request_telemetry：
                                                              套重试策略 + auth.apply_auth(req)
-  http-client/src/transport.rs:34  HttpTransport::stream() <- 真正发字节
+  http-client/src/transport.rs:41  HttpTransport::stream() <- 真正发字节
   codex-api/src/sse/spawn_response_stream                  解析 SSE 事件
 ```
 
@@ -1012,7 +1328,7 @@ WebSocket 的定位是**"有就赚到"的优化，不是前提假设**。三条�
    因为 WS 升级握手还没实现 SigV4 签名。
 
 3. **会话级 fallback**：一旦某轮退回 HTTP，后续 turn 都不再尝试
-   （`client.rs:253` 的注释："WebSocket fallback is session-scoped"）。
+   （`client.rs:258` 的注释："WebSocket fallback is session-scoped"）。
    `force_http_fallback()` 会打点 `codex.transport.fallback_to_http`。
 
 还有一处取舍写在 `client.rs` 头注释里，标题就叫 **Retry-Budget Tradeoff**：
@@ -1072,7 +1388,7 @@ available: (config.model_provider.is_openai()
 好处和代价都很明确：模型不会去调一个不存在的工具；但如果某个 provider 其实支持
 却没声明，就白白用不上，得手工在 config.toml 里打开标志位。
 
-顺带记两件相关的事：
+另外两件相关的事：
 
 - 私有端点的判定走的是同一套（`alpha/search`、`memories/trace_summarize`）。
   注意后者**当前没有生产调用点**，记忆抽取实际走主模型的 Phase 1 / Phase 2。
@@ -1136,7 +1452,7 @@ codex-rs/core/src/context_manager/updates.rs                # merge_contextual_f
 codex-rs/core/src/context_manager/history.rs:581            # for_prompt：发送前从历史取快照
 codex-rs/core/src/session/mod.rs:3461                       # record_conversation_items
 codex-rs/core/src/session/mod.rs:4192                       # build_turn_context_contribution_items
-codex-rs/core/src/session/mod.rs:4215                       # build_initial_context_with_world_state
+codex-rs/core/src/session/mod.rs:4224                       # build_initial_context_with_world_state
 codex-rs/core/src/session/mod.rs:1491                       # get_prompt_base_instructions
 codex-rs/core/src/session/turn.rs:1589                      # build_prompt
 codex-rs/core/src/client_common.rs:23                       # Prompt 结构
@@ -1145,7 +1461,7 @@ codex-rs/ext/extension-api/src/contributors/prompt.rs       # PromptFragment / P
 
 ### ③ 关键设计
 
-#### a. 先看"发送"这一步有多简单
+#### a. 发送这一步有多简单
 
 `Prompt`（`core/src/client_common.rs:23`）一共就七个字段：
 
@@ -1213,8 +1529,8 @@ classification, using `generic` for shared fragments."* 它不为 UI 服务，�
 
 | 时机 | 入口 | 说明 |
 |---|---|---|
-| 初始上下文 | `build_initial_context_with_world_state`（`session/mod.rs:4215`） | 新会话 / 压缩后 / 需要全量重建时 |
-| world state 差异 | `record_step_world_state_if_changed`（`session/mod.rs:3606`） | 每步只发和上一份 snapshot 的差异（下一节展开） |
+| 初始上下文 | `build_initial_context_with_world_state`（`session/mod.rs:4224`） | 新会话 / 压缩后 / 需要全量重建时 |
+| world state 差异 | `record_step_world_state_if_changed`（`session/mod.rs:3607`） | 每步只发和上一份 snapshot 的差异（下一节展开） |
 | turn 上下文贡献 | `build_turn_context_contribution_items`（`session/mod.rs:4192`） | turn 级设置变了才注入 |
 
 第三种的门槛在 `session/mod.rs:4640`：
@@ -1372,7 +1688,7 @@ codex-rs/core/src/context/world_state/mod.rs:313     # merge_patch_from / apply_
 codex-rs/core/src/context/world_state/mod.rs:415     # render_history_diff
 codex-rs/core/src/context/world_state/               # 19 个内置 section 实现
 codex-rs/core/src/session/world_state.rs:40          # build_world_state_for_step
-codex-rs/core/src/session/mod.rs:3606                # record_step_world_state_if_changed
+codex-rs/core/src/session/mod.rs:3607                # record_step_world_state_if_changed
 codex-rs/core/src/context_manager/history.rs:446     # update_world_state / set_world_state_baseline
 ```
 
@@ -1380,7 +1696,7 @@ codex-rs/core/src/context_manager/history.rs:446     # update_world_state / set_
 
 #### a. 三段式：build → diff → record
 
-每一轮采样请求，world state 只走三步（`session/mod.rs:3606`）：
+每一轮采样请求，world state 只走三步（`session/mod.rs:3607`）：
 
 ```rust
 pub(crate) async fn record_step_world_state_if_changed(&self, previous_world_state, step_context) {

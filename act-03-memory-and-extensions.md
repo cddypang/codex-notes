@@ -155,7 +155,7 @@ codex-rs/memories/write/templates/memories/
 - Phase 1 抽取：`reasoning_effort = Low`、并发 8、最多扫 5000 thread、占上下文 70%
 - Phase 2 合并：`reasoning_effort = Medium`、先算 workspace diff（≤4MB）
 - 目录布局：`raw_memories.md` / `rollout_summaries/` / `extensions/`
-- ad-hoc notes：用户说"记住/忘掉"时的唯一合法写入点
+- ad-hoc notes：用户在对话中提出"记住/忘掉"时的唯一合法写入点
 - 安全保障：`guard.rs`、拒绝符号链接 root、extension 资源 7 天保留
 - feature 开关：`MemoryTool` / `ExternalAgentMemoryImport` / `Chronicle`
 
