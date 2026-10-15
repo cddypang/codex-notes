@@ -748,7 +748,20 @@ app_server.turn_start(thread_id, client_user_message_id, items, cwd, …)
 54. core/src/tasks/mod.rs:287                          start_task
 55. core/src/tasks/regular.rs:40                         RegularTask::run # ← 进入 turn 内部
 56. core/src/session/turn.rs:163                           run_turn
-57. core/src/session/turn.rs:1618                            run_sampling_request   # ← 交给第 3 节
+57. core/src/session/turn.rs:1618                            run_sampling_request   # ← 一次采样请求（内部见第 3 节）
+```
+
+从第 57 步返回之后，`run_turn` 还要走完 turn 自己的收敛路径（采样内部结束后才会走到这里）：
+
+```text
+core/src/session/turn.rs:536      run_turn：match sampling_request_result
+core/src/session/turn.rs:566      needs_follow_up = model_needs_follow_up || has_pending_input
+core/src/session/turn.rs:757      continue             # 需要续跑（模型要工具调用 / 有 steer 输入）→ 回到 loop 顶部再采样
+core/src/session/turn.rs:655      run_turn_stop_hooks  # 不需要续跑 → 先过 Stop hook（可阻断 / 可延长）
+core/src/session/turn.rs:726      run_auto_compact     # 达到阈值时做 post-turn 压缩
+core/src/session/turn.rs:755      break                # turn 收敛
+core/src/tasks/mod.rs:630        on_task_finished     # 发 TurnComplete / TurnAborted + 落盘最后历史
+core/src/session/turn.rs:839      run_turn 返回 Ok(last_agent_message)
 ```
 
 五处值得注意的衔接：
@@ -827,7 +840,10 @@ app_server.turn_start(thread_id, client_user_message_id, items, cwd, …)
   而 `RegularTask::run` 内部还会再发一次 `TurnStartPhase::RegularTaskStart`——
   这就是第零幕 `TurnStartPhase` 两个取值的实际用途。）
 
-- **第 57 步交给第 3 节**：`run_sampling_request` 内部就是"发模型请求"。
+- **第 57 步是第 3 节的入口，不是这条链的终点**：`run_sampling_request` 内部就是"发模型请求"，
+  它展开在第 3 节；等它返回，上面那段收敛路径才走完 turn——`run_turn` 按 `needs_follow_up`
+  决定"再发一轮采样"还是"过 Stop hook / post-turn 压缩后收敛"，最后由 `on_task_finished`
+  发事件并落盘。
 
 #### c. 三层身份怎么对应
 
@@ -1071,6 +1087,9 @@ Op::Interrupt
 
 因为那一层描述的是**运行时在跑什么**，被管理的东西就是 `RunningTask`。而因为一个 thread
 同时只允许一个 task，它等价于"同时只允许一个 turn"。更详细的读法在第 1 节 ③b。
+
+---
+
 ## 3. 模型接入
 
 ### ① 问题
@@ -1092,11 +1111,11 @@ Op::Interrupt
 
 ### ② 代码入口
 
-第 2 节的链在第 57 步（`run_sampling_request`）停下，那里正是"要发一次模型请求"的时刻。
-本节从那里接着走——**一个 `Prompt` 怎么变成网络上的字节，又怎么变回事件流**：
+第 2 节的链在第 57 步（`run_sampling_request`）接入本节——那里正是"要发一次模型请求"的时刻。
+本节进入它的内部——**一个 `Prompt` 怎么变成网络上的字节，又怎么变回事件流**：
 
 ```text
-57. core/src/session/turn.rs:1618             run_sampling_request          （第 2 节的终点）
+57. core/src/session/turn.rs:1618             run_sampling_request          # 第 2 节的链在此接入
 58. core/src/session/turn.rs:1684               try_run_sampling_request(...)
 59. core/src/session/turn.rs:2572                 client_session.stream(prompt, ...)
 60. core/src/client.rs:2226                    ModelClientSession::stream
@@ -1245,7 +1264,7 @@ pub struct ResponsesApiRequest {
 
   也就是说接入一个自定义 provider 的门槛不是"兼容 OpenAI"，而是"兼容 Responses API"。
 
-#### c. SSE 是什么（前置概念）
+#### c. SSE 是什么
 
 要讲清楚两种传输，得先知道 SSE（Server-Sent Events）是什么。
 
