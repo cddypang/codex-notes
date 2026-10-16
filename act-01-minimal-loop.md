@@ -1453,6 +1453,27 @@ Codex 选的是前者，和它整体"不探测、只声明"的取向一致。
 这一节的关键认知是**反直觉**的：**上下文组装发生在"记录"的时候，不在"发送"的时候。**
 发送请求时只是从历史里取一份快照。想明白这一点，整条链就通了。
 
+先把两个词说清楚，否则后面会一直绕：
+
+- **历史** —— 代码里就是 `ContextManager`（`core/src/context_manager/history.rs:89`，注释原文是
+  *"Transcript of thread history"*）。它挂在 `SessionState.history` 上（`core/src/state/session.rs:75`），
+  并增量落盘到该 thread 的 rollout 文件。所以**历史归属 thread，不归属 `Session`**——进程退出时
+  `Session` 析构、rollout 还在，`codex resume` 用 `apply_rollout_reconstruction`
+  （`core/src/session/mod.rs:1703`）把它重建出来，还是同一条历史。
+- **上下文** —— 模型能看到的那份窗口，就是**这份历史本身**；发送时只是取它的快照，不是另组一份。
+
+边界的问题也由此明确了：**不存在"每个 sampling request 一套上下文"这回事。** 每次请求的
+`prompt.input` 都是"当前整条 thread 历史"在那一刻的快照；请求之间的差异只来自三处：
+
+- 这一轮新写进去的 item（下面 ② 里那些"写"）；
+- 发送时的模态裁剪（`for_prompt`）；
+- **压缩**——唯一会真正改写边界的操作，而且是**整体替换**历史（`HistoryReplacement` /
+  `replace_compacted`，`core/src/context_manager/history.rs:686`）。替换之后，模型窗口就小于
+  磁盘上的完整记录了。
+
+（另注意：模型一次请求看到的不止 `input`。`base_instructions` 和本轮工具表 `tools` 在 `Prompt` 里是
+**独立字段**，不走 `input`——见 ③e / ③f。）
+
 于是问题变成三个：
 
 1. 一段要注入模型的上下文，是怎么从代码变成历史里的一条 item 的？
@@ -1463,60 +1484,117 @@ Codex 选的是前者，和它整体"不探测、只声明"的取向一致。
 
 ### ② 代码入口
 
+两节的接点先定住：第 3 节的链从第 58 步起用到一个 `&prompt`——`try_run_sampling_request(..., &prompt, ...)`，
+第 59 步 `client_session.stream(prompt, ...)` 把它送上网；而这个 `Prompt` 是在第 57 步
+`run_sampling_request` 体内拼出来的。所以两节的接点是同一个 `Prompt`——**第 3 节讲它怎么变成
+网络上的字节，本节讲它怎么被组装出来。**
+
+先看"取"这一侧，它很短——因为真的只是取一张快照：
+
 ```text
-codex-rs/context-fragments/src/fragment.rs                  # ContextualUserFragment trait 定义
-codex-rs/core/src/context/mod.rs                            # 54 个片段模块的清单
-codex-rs/core/src/context/contextual_user_message.rs        # 识别"这条 item 是不是注入的"
-codex-rs/core/src/context_manager/updates.rs                # merge_contextual_fragments / build_rendered_message
-codex-rs/core/src/context_manager/history.rs:581            # for_prompt：发送前从历史取快照
-codex-rs/core/src/session/mod.rs:3461                       # record_conversation_items
-codex-rs/core/src/session/mod.rs:4192                       # build_turn_context_contribution_items
-codex-rs/core/src/session/mod.rs:4224                       # build_initial_context_with_world_state
-codex-rs/core/src/session/mod.rs:1491                       # get_prompt_base_instructions
-codex-rs/core/src/session/turn.rs:1589                      # build_prompt
-codex-rs/core/src/client_common.rs:23                       # Prompt 结构
-codex-rs/ext/extension-api/src/contributors/prompt.rs       # PromptFragment / PromptSlot（扩展侧）
+【读】core/src/session/turn.rs:516   clone_history().for_prompt(...)    # 取一份历史快照
+【发】core/src/session/turn.rs:524   run_sampling_request(...)          # 第 3 节的入口
+        └ core/src/session/turn.rs:1659   prompt_input（重试 / 续圈时重取）
+          → core/src/session/turn.rs:1667   build_prompt(...)  ->  Prompt
 ```
+
+（`prompt_input` 只有两个来源：首圈用 `run_turn` 拼好的 `sampling_request_input`；重试 / 续圈才走
+`clone_history().for_prompt(...)`。）
+
+"组装"不在这里发生——它**没有独立的阶段**，就发生在"往历史里写 item"的那一刻。写历史的唯一
+入口是：
+
+```text
+core/src/session/mod.rs:3461     record_conversation_items    # 写历史的唯一入口
+```
+
+而它的触发**两个来源都有**：既在 `run_turn` 内部，也有 `run_turn` 之外的独立入口。
+
+| 来源 | 在 `run_turn` 内？ | 典型场景 |
+|---|---|---|
+| `run_turn` 的每一圈 | ✅ | 注入项、steer 输入、world state 差异、模型回流 |
+| `run_turn` 之外的独立入口 | ❌ | 会话建立期注入、异步注入、异步 hook、目标更新 |
+
+下面按**时间顺序**排。
+
+#### 一、turn 之外（独立触发，不经过 `run_turn`）
+
+```text
+会话建立期（新会话 / 压缩后全量重建）
+  core/src/session/mod.rs:4224     build_initial_context_with_world_state
+  core/src/session/mod.rs:4192     build_turn_context_contribution_items   # turn 级设置变了才注入
+
+运行期异步送到，不等 turn 发起
+  core/src/session/inject.rs:170   inject_no_new_turn        # 没有活跃 turn 就直接记录
+  core/src/session/inject.rs:17    inject_if_running         # 有 turn 在跑 → 塞给当前 turn
+  core/src/hook_runtime.rs:849     record_additional_contexts    # 异步 hook 完成后补的上下文
+  core/src/session/retained_context.rs:80   record_user_goal_update   # 目标更新，不新开 turn
+```
+
+#### 二、turn 之内：`run_turn` 的每一圈（主路径）
+
+进 `loop`（`core/src/session/turn.rs:426`）之前先做一次准备，然后每圈再重复一遍。所有这些"写"
+都落到同一个入口 `record_conversation_items`（`core/src/session/mod.rs:3461`）——它是历史唯一的
+写入口。按发生顺序：
+
+**进 `loop` 之前（只做一次）**
+
+```text
+core/src/session/turn.rs:368   run_hooks_and_record_inputs(TurnStart)
+                               跑输入类 hook（可以阻断本轮）+ 把本轮自己的 input 记进历史
+core/src/session/turn.rs:399   注入项逐条记录
+                               skills / plugins 的 injection_items
+```
+
+**`loop` 每圈（顺序固定，都发生在上面那张快照之前）**
+
+```text
+core/src/session/turn.rs:439   run_hooks_and_record_inputs(SteeredUserInput)
+                               排空本圈的 steer / 排队输入：先过 hook，再记进历史
+                                 ↳ turn.rs:866 → :902 record_pending_input（hook_runtime.rs:716）
+                                   → session/inject.rs:123 record_annotated_conversation_items
+core/src/session/turn.rs:454   rollout_budget::maybe_record_reminder                  # 预算提醒
+core/src/session/turn.rs:500   time_reminder::maybe_record_current_time_reminder      # 时间提醒
+core/src/session/turn.rs:507   record_step_world_state_if_changed                     # world state 差异
+core/src/session/turn.rs:512   record_reasoning_effort_override                       # 推理强度覆盖
+```
+
+**模型回流时（在【发】之后）**
+
+```text
+core/src/stream_events_utils.rs:100   record_conversation_items 的落点
+  ↑ :93    record_completed_response_item_with_finalized_facts
+  ↑ :315   handle_output_item_done            （← core/src/session/turn.rs:2780）
+  ↑ core/src/session/turn.rs:2418  handle_assistant_item_done_in_plan_mode  （← :2734，plan mode）
+core/src/stream_events_utils.rs:416   工具错误回灌的文本
+```
+
+（`core/src/session/turn.rs:604` 的 `token_budget::maybe_record` 也在这一档——它在**采样之后**触发。）
+
+#### 三、其它任务形态（也写历史，只是不走 `run_turn`）
+
+```text
+core/src/tasks/review.rs:239      Review 任务
+core/src/tasks/user_shell.rs:468  user shell 任务（不走模型）
+core/src/tasks/mod.rs:975         中断收尾：写 InterruptedTurnHistoryMarker
+core/src/compact.rs:361           压缩：整体替换历史，刻意跳过 record_conversation_items
+```
+
+#### 小结：这些"写"与【发】是什么关系
+
+**没有"调用关系"。** 上面这些"写"都不是被【发】调用的，它们是【发】的"上游生产者"——发出去之前，
+历史已经被前面这些步骤写完；模型返回的内容又写回历史，供下一圈取快照。落到代码上就是本节标题
+那句话：**组装发生在这些"写"里（记录时），取快照那一步什么都不组装。**
+
+至于"写进去的到底是什么东西、怎么变成一条 item"——那是 ③ 的前两节（a / b）。
 
 ### ③ 关键设计
 
-#### a. 发送这一步有多简单
+#### a. 写进去的是什么：`ResponseItem` 与 `ContextualUserFragment`
 
-`Prompt`（`core/src/client_common.rs:23`）一共就七个字段：
-
-```rust
-pub struct Prompt {
-    pub input: Vec<ResponseItem>,              // ← 对话上下文
-    pub(crate) tools: Arc<[ToolSpec]>,
-    pub(crate) parallel_tool_calls: bool,
-    pub base_instructions: BaseInstructions,   // ← 单独一条通道
-    pub output_schema: Option<Value>,
-    pub output_schema_strict: bool,
-    pub(crate) cyber_access_program: Option<CyberAccessProgram>,
-}
-```
-
-而 `build_prompt`（`turn.rs:1589`）几乎是纯赋值——它只做一件事：把 `StepContext` 里的字段
-搬进 `Prompt`。
-
-真正"取上下文"发生在它上面几行（`turn.rs:1659`）：
-
-```rust
-let prompt_input = sess.clone_history().await
-    .for_prompt(&step_context.settings.model_info.input_modalities);
-```
-
-`for_prompt`（`context_manager/history.rs:581`）的文档注释说明了它做什么：
-
-> Returns the history prepared for sending to the model. This applies a proper normalization and
-> drops un-suited items. Unsupported image and audio content is stripped from messages and tool
-> outputs according to `input_modalities`.
-
-**所以：发送 = 克隆历史 + 按模型能力裁剪。没有"拼 prompt"这一步。**
-
-#### b. `ContextualUserFragment`：注入内容的唯一形态
-
-注入模型的每一段上下文都必须实现这个 trait（`context-fragments/src/fragment.rs`）：
+不管从 ② 里哪个入口进，写进历史的都是 `ResponseItem`（历史本身就是 `Vec<ResponseItemEnvelope>`）。
+而"注入类"内容——权限说明、world state 差异、记忆摘要、技能正文……——统一用一种形态表达。注入
+模型的每一段上下文都必须实现这个 trait（`codex-rs/context-fragments/src/fragment.rs:64`）：
 
 ```rust
 pub trait ContextualUserFragment {
@@ -1527,12 +1605,19 @@ pub trait ContextualUserFragment {
     fn body(&self) -> String;
     fn type_markers() -> (&'static str, &'static str) where Self: Sized;
     fn matches_text(text: &str) -> bool where Self: Sized { ... }
+
+    // 下面三个是 trait 提供的默认实现，实现方不用自己写
+    fn render(&self) -> String { ... }                      // markers + body = 最终文本
+    fn render_fragment(&self) -> RenderedFragment { ... }   // role + render() + content_kind
+    fn into(self) -> ResponseItem { ... }                   // 直接变 ResponseItem
 }
 ```
 
 三个要点：
 
-- **`render()` 不加分隔符**：文档注释明确要求"实现方要自己在 `body()` 里带上需要的空白"。
+- **`render()` 不加分隔符**：`render()`（`fragment.rs:91`）是默认实现，做的事就是把 `markers()` 和
+  `body()` 拼起来——`format!("{start_marker}{body}{end_marker}")`——中间**不插任何分隔符**。
+  所以 trait 的文档注释才要求"实现方要自己在 `body()` 里带上需要的空白"。
 - **`markers()` 要成对出现**：要么都有、要么都空。有标记的片段才能被 `matches_text()` 认出来
   ——这是"这段注入内容还在不在历史里"的判据，下一节会用到。
 - **`into()` 直接变 `ResponseItem`**：`render_fragment()` 把 `role` + 渲染结果 +
@@ -1542,30 +1627,18 @@ pub trait ContextualUserFragment {
 classification, using `generic` for shared fragments."* 它不为 UI 服务，而是给**服务端**
 做分类用（对应 `Feature::ContentItemKinds`）。
 
-#### c. 三类注入时机
+这些片段都定义在哪、由谁构造（也就是 ② 里那些"写"的素材）：
 
-注入不是"每轮都重来"，而是分三种情况：
-
-| 时机 | 入口 | 说明 |
-|---|---|---|
-| 初始上下文 | `build_initial_context_with_world_state`（`session/mod.rs:4224`） | 新会话 / 压缩后 / 需要全量重建时 |
-| world state 差异 | `record_step_world_state_if_changed`（`session/mod.rs:3607`） | 每步只发和上一份 snapshot 的差异（下一节展开） |
-| turn 上下文贡献 | `build_turn_context_contribution_items`（`session/mod.rs:4192`） | turn 级设置变了才注入 |
-
-第三种的门槛在 `session/mod.rs:4640`：
-
-```rust
-if !should_inject_full_context && turn_context_changed {
-    context_items.extend(self.build_turn_context_contribution_items(step_context).await);
-}
+```text
+片段清单     codex-rs/core/src/context/mod.rs                     54 个片段模块的清单
+识别注入项   core/src/context/contextual_user_message.rs
+片段 → item  core/src/context_manager/updates.rs:12,32             build_rendered_message / merge_contextual_fragments（见 b）
+扩展侧构造   codex-rs/ext/extension-api/src/contributors/prompt.rs  PromptFragment / PromptSlot（见 d）
 ```
 
-——**只有 `turn_context_changed` 为真才注入**。这就是"避免频繁变更造成 cache miss"那条规则
-的落地：设置没变就不发，历史自然稳定，prompt cache 才能命中。
+#### b. 片段怎么合成一条 item：`merge_contextual_fragments`
 
-#### d. 合并规则：`merge_contextual_fragments`
-
-一堆片段要变成 `ResponseItem`，规则在 `context_manager/updates.rs`：
+有了片段形态（a），接下来看它们怎么变成一条 `ResponseItem`——规则在 `context_manager/updates.rs`：
 
 ```rust
 for fragment in fragments {
@@ -1587,7 +1660,89 @@ for fragment in fragments {
 
 所以"合并"只是打包成一条，**每段的身份不会丢**。
 
-#### e. base instructions 走的是另一条路
+#### c. 什么时候写：三类注入时机
+
+② 回答的是"谁在写"；这里回答"为什么有些轮次写、有些不写"——注入不是"每轮都重来"，而是分三种情况：
+
+| 时机 | 入口 | 说明 |
+|---|---|---|
+| 初始上下文 | `build_initial_context_with_world_state`（`session/mod.rs:4224`） | 新会话 / 压缩后 / 需要全量重建时（= ② 的"会话建立期"） |
+| world state 差异 | `record_step_world_state_if_changed`（`session/mod.rs:3607`） | 每步只发和上一份 snapshot 的差异（= ② 的 `turn.rs:507`，下一节展开） |
+| turn 上下文贡献 | `build_turn_context_contribution_items`（`session/mod.rs:4192`） | turn 级设置变了才注入（= ② 的 `:4192`） |
+
+第三种的门槛在 `session/mod.rs:4640`：
+
+```rust
+if !should_inject_full_context && turn_context_changed {
+    context_items.extend(self.build_turn_context_contribution_items(step_context).await);
+}
+```
+
+——**只有 `turn_context_changed` 为真才注入**。这就是"避免频繁变更造成 cache miss"那条规则
+的落地：设置没变就不发，历史自然稳定，prompt cache 才能命中。
+
+#### d. 扩展怎么往里加东西
+
+扩展不直接构造 `ResponseItem`，而是产出 `PromptFragment`
+（`ext/extension-api/src/contributors/prompt.rs`）：
+
+```rust
+pub enum PromptSlot {
+    DeveloperPolicy,
+    DeveloperCapabilities,
+    /// Text inside the context-window message, supplied by `contribute_thread_context`.
+    ContextWindow,
+}
+```
+
+加三种构造函数：`PromptFragment::new` / `developer_policy` / `developer_capability`。
+
+**注意 slot 只有三个**——扩展能决定"放哪个槽"，但**不能决定"放在历史的哪个位置"**。
+位置由 Core 在组装时统一决定。这是刻意的限制，也是"不重写历史"能成立的前提。
+
+（② 里 `turn.rs:399` 注入的 skills / plugins 注入项，以及 `build_extension_turn_input_items`
+收集的扩展输入，走的就是这条路。）
+
+#### e. "读"这一步有多简单
+
+回到 ② 开头那条【读】。`Prompt`（`core/src/client_common.rs:23`）一共就七个字段：
+
+```rust
+pub struct Prompt {
+    pub input: Vec<ResponseItem>,              // ← 就是上面写进历史的那批 item
+    pub(crate) tools: Arc<[ToolSpec]>,
+    pub(crate) parallel_tool_calls: bool,
+    pub base_instructions: BaseInstructions,   // ← 单独一条通道
+    pub output_schema: Option<Value>,
+    pub output_schema_strict: bool,
+    pub(crate) cyber_access_program: Option<CyberAccessProgram>,
+}
+```
+
+而 `build_prompt`（定义 `turn.rs:1589`，`run_sampling_request` 里在 `turn.rs:1667` 调用）几乎是
+纯赋值——它只做一件事：把 `StepContext` 里的字段搬进 `Prompt`。
+
+真正"取上下文"发生在它上面几行（`turn.rs:1659` 的 `for_prompt`）：
+
+```rust
+let prompt_input = sess.clone_history().await
+    .for_prompt(&step_context.settings.model_info.input_modalities);
+```
+
+`for_prompt`（`context_manager/history.rs:581`）的文档注释说明了它做什么：
+
+> Returns the history prepared for sending to the model. This applies a proper normalization and
+> drops un-suited items. Unsupported image and audio content is stripped from messages and tool
+> outputs according to `input_modalities`.
+
+**所以：发送 = 克隆历史 + 按模型能力裁剪。没有"拼 prompt"这一步。**
+
+两个支撑事实：`clone_history()`（`core/src/session/mod.rs:4475` → `core/src/state/session.rs:169`）
+就是 `self.history.clone()`，而 `ContextManager` 内部是 `Arc<Vec<ResponseItemEnvelope>>`——
+**快照是共享的，不深拷贝**；`history_version`（`core/src/context_manager/history.rs:102`）在压缩 /
+回滚这类"历史被重写"的操作时递增，用来让下游知道窗口换了。
+
+#### f. base instructions 走的是另一条路
 
 它**不在 `input` 里**，而是 `Prompt` 的独立字段。来源是
 `get_prompt_base_instructions`（`session/mod.rs:1491`），里面有一层特殊处理：
@@ -1611,25 +1766,6 @@ if !config.update_plan_enabled
 
 这又是"持久状态"和"本次请求视图"分离的同一个模式（对比 §2 的 `StepContext`）。
 
-#### f. 扩展怎么往里加东西
-
-扩展不直接构造 `ResponseItem`，而是产出 `PromptFragment`
-（`ext/extension-api/src/contributors/prompt.rs`）：
-
-```rust
-pub enum PromptSlot {
-    DeveloperPolicy,
-    DeveloperCapabilities,
-    /// Text inside the context-window message, supplied by `contribute_thread_context`.
-    ContextWindow,
-}
-```
-
-加三种构造函数：`PromptFragment::new` / `developer_policy` / `developer_capability`。
-
-**注意 slot 只有三个**——扩展能决定"放哪个槽"，但**不能决定"放在历史的哪个位置"**。
-位置由 Core 在组装时统一决定。这是刻意的限制，也是"不重写历史"能成立的前提。
-
 #### g. 大小控制的两层
 
 | 层 | 手段 |
@@ -1650,7 +1786,10 @@ AGENTS.md 里那几条硬规则可以对着看：
 
 ### ④ 取舍
 
-**为什么不用一个大字符串模板？**
+三个取舍分别对应上面的设计：**类型化片段**（a / b）、**不重写历史**（② 与 c）、
+**base instructions 单独通道**（f）。
+
+**为什么不用一个大字符串模板？（对应 ③a / ③b）**
 
 因为模板能表达"内容"，但表达不了"这段内容是什么、有多长、还在不在历史里"。
 类型化片段换来四件事：可测试（每个片段单独 snapshot）、可截断（各自有上限）、
@@ -1659,7 +1798,7 @@ AGENTS.md 里那几条硬规则可以对着看：
 代价是样板代码：加一个片段要新建模块、实现 trait、注册进 `context/mod.rs`。
 从 54 个模块这个数字就能看出这个成本是真实存在的。
 
-**"不重写历史"这条规则挡住了什么？**
+**"不重写历史"这条规则挡住了什么？（对应 ② 与 ③c）**
 
 它挡住了很多看起来更简单的实现，最典型的是"每轮重新拼整个 prompt"。那种做法下，
 任何一处改动都会让整个前缀变化，prompt cache 直接失效，压缩策略也没法做增量。
@@ -1667,7 +1806,7 @@ AGENTS.md 里那几条硬规则可以对着看：
 它带来的约束是：**新上下文只能追加，不能插入或改写**。所以像"更新一条权限说明"这种事，
 只能靠下一节的 world state 差异机制实现——发一条新的差异 item，而不是去改旧的。
 
-**base instructions 为什么要单独一条通道？**
+**base instructions 为什么要单独一条通道？（对应 ③f）**
 
 因为它的生命周期和普通上下文不同：由配置决定、可能被 fork 继承、还有 provenance
 （来自模型还是配置）。把它塞进 `input` 会让"这条指令从哪来"变得不可追溯。
