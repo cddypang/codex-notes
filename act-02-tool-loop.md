@@ -5,7 +5,7 @@
 >
 > **前置依赖**：第一幕（尤其是第 2 节的 turn 循环、第 4 节的上下文组装）。
 >
-> **状态**：第 6 节正文完成；第 7–8 节仍为大纲
+> **状态**：第 6–7 节正文完成；第 8 节仍为大纲
 
 ---
 
@@ -470,35 +470,366 @@ runtime，local 版则发送普通 function call。两者共享“搜索”语�
 
 ## 7. 工具循环与并发
 
-### ① 问题
+### ① 问题：模型一次返回多个工具调用时，谁先跑、结果怎么排
 
-模型一次返回多个工具调用怎么办？循环在哪里终止？工具失败了怎么回灌？
+继续上一幕的代码搜索场景。用户说：
+
+> 修复退款流程的失败测试：分别在 orders 和 billing 模块里搜索 refund 的实现，检查测试失败日志，
+> 如果发现明显的断言错误就修掉。
+
+模型第一轮可能返回三个互相独立的调用：
+
+```text
+[1] exec_command   rg -n "refund" crates/orders
+[2] exec_command   rg -n "refund" crates/billing
+[3] exec_command   rg -n "AssertionError|expected|actual" artifacts/refund-test.log
+```
+
+注意这里没有 `apply_patch`。模型还没有看到搜索结果和测试日志，无法知道应该修改哪个文件、哪条断言；
+修文件依赖前三个调用的结果，必须等它们回灌后，在下一轮模型请求里再决定。
+
+所以这一批调用需要满足几个看似简单、实际互相冲突的要求：
+
+- 两个代码搜索和一次失败日志检索可以同时跑，否则每多一个只读操作就多一次等待；
+- 模型收到的工具结果必须按它发出调用的顺序排列，否则 `call_1` 的输出可能被配到
+  `call_2` 的上下文位置；
+- 用户中断、Code Mode 取消或进程退出时，不能留下“调用已记录但永远没有结果”的悬挂状态；
+- 工具错误有时应该交给模型纠正，有时代表 host 已经无法继续。
+
+等三个结果都回灌后，模型才可能在下一轮调用 `apply_patch`。它在并发门中默认独占执行，
+不会和上一轮仍在进行的读工具交错。本节沿着这次“并行调查 → 串行修改”的过程，
+回答上面的问题。
 
 ### ② 代码入口
 
+接点在第一幕第 2 节的 turn 循环和第 6 节末端：
+
 ```text
-codex-rs/core/src/tools/router.rs               # 调用分发
-codex-rs/core/src/tools/orchestrator.rs
-codex-rs/core/src/tools/parallel.rs             # 并发与取消
-codex-rs/core/src/tools/executed_tool_calls.rs  # 调用记录
-codex-rs/core/src/tools/lifecycle.rs            # 生命周期通知
-codex-rs/core/src/tools/events.rs
+core/src/session/turn.rs:2525              try_run_sampling_request
+  └─ ResponseEvent::OutputItemDone
+       └─ core/src/stream_events_utils.rs:315   handle_output_item_done
+            └─ core/src/tools/router.rs:248     build_tool_call
+                 └─ core/src/tools/parallel.rs:77   handle_tool_call
+
+ResponseEvent::Completed
+  └─ core/src/session/turn.rs:2472         drain_in_flight
+       └─ FuturesOrdered
+            └─ core/src/tools/parallel.rs:125   handle_tool_call_with_source
+                 └─ core/src/tools/registry.rs:527   dispatch_any_with_state
+                      └─ ToolExecutor::handle
+                           └─ AnyToolResult::into_response
 ```
+
+按时间顺序展开：
+
+```text
+1. 模型流里出现一个完整的 function/custom tool call
+2. build_tool_call 把 ResponseItem 解析成 ToolCall
+3. 原始 call item 立刻写入历史 / rollout
+4. handle_tool_call 生成一个 future，放入 FuturesOrdered
+5. needs_follow_up = true
+6. 流结束后 drain_in_flight 开始轮询所有 future
+7. 每个 ToolCallRuntime：
+     记录调用 → 等 readiness → 进并发门 → registry 分派 → handler
+8. ToolOutput 转成 function_call_output / custom_tool_call_output
+9. 按模型调用顺序写入历史
+10. try_run_sampling_request 返回 needs_follow_up，外层 run_turn 发起下一次模型请求
+```
+
+一个容易误解的时序是：**工具 future 会先排队，但不会在模型还没把响应流读完时立即执行。**
+`handle_output_item_done` 只把 future 放进 `in_flight`（`core/src/session/turn.rs:2787`）；
+直到收到 `ResponseEvent::Completed` 并在流循环结束后，代码才调用
+`drain_in_flight`（`core/src/session/turn.rs:3162`）开始轮询它们。代码注释也明确写了：
+
+> The sampling loop collects results in order only after its stream ends.
+
+这样 host 可以先完整记录模型要求调用哪些工具，再统一开始执行，避免模型仍在追加调用时，
+前面已经有副作用工具开始修改工作区。
 
 ### ③ 关键设计
 
-- 从模型输出到 handler 的匹配路径
-- 并行执行：并发上限、取消传播（`Feature::CodeModeInterrupt` / `InstantInterrupt`）
-- 结果回灌格式：`FunctionCallOutputPayload` / `ResponseInputItem`
-- 错误分类：`FunctionCallError::RespondToModel` vs `Fatal`
-  （见 `ext/memories/src/tools/mod.rs` 的 `backend_error_to_function_call`）
-- 控制类工具 vs 普通工具（`is_builtin_control_tool`）
-- 终止条件：没有新的工具调用 → turn 结束
+#### a. 从模型 item 到 `ToolCall`
+
+`ToolRouter::build_tool_call`（`core/src/tools/router.rs:248`）只接受三类可执行调用：
+
+- `ResponseItem::FunctionCall` → `ToolPayload::Function`；
+- execution 为 `client` 的 `ToolSearchCall` → `ToolPayload::ToolSearch`；
+- `CustomToolCall` → `ToolPayload::Custom`。
+
+`WebSearchCall` 不在这里处理：它可能由服务端执行，最终作为非工具 response item 记录。
+这也是第 6 节“有 spec、没有本地 executor”的落点。
+
+成功解析后，`handle_output_item_done`
+（`core/src/stream_events_utils.rs:315`）先做一件对恢复很重要的事：
+
+```rust
+record_completed_response_item(...).await;
+```
+
+工具调用 item 在真正执行前已经进入 thread history 和 rollout。这里记录的是**调用意图**，
+不是结果。若进程在工具运行中崩溃，恢复后至少能看到“这个 `call_id` 曾经被请求”，不会凭空丢掉半条调用记录。
+
+随后它创建 `InFlightFuture` 并把 `needs_follow_up` 设为 `true`。这意味着只要模型请求了工具，
+本轮模型采样就不可能直接结束；即使执行结果只是一句错误，也要回灌后再让模型决定下一步。
+
+#### b. `ToolCallRuntime`：统一包装一次调用
+
+`ToolCallRuntime`（`core/src/tools/parallel.rs:45`）保存跨调用共享的运行时状态：
+
+- 当前 `Session`；
+- 发出调用时对应的 `StepContext` 和 `ToolRouter`；
+- 同一个 turn 的 diff tracker；
+- 一个 `RwLock<()>`，作为工具并发门。
+
+`handle_tool_call`（`core/src/tools/parallel.rs:77`）先准备 executed-call 记录，再调用
+`handle_tool_call_with_source`。后者完成以下顺序：
+
+```text
+记录 ToolCall
+  → 发出 on_tool_dispatch
+  → 等待工具 readiness（例如 MCP server）
+  → 获取并行读锁或独占写锁
+  → ToolRouter 定位 runtime
+  → CoreToolRuntime::dispatch
+       → pre-tool hooks / 参数重写
+       → notify_tool_start
+       → ToolExecutor::handle
+       → ToolOutput 转换
+       → post-tool hooks / result feedback
+       → notify_tool_finish
+```
+
+这里的 `dispatch` 是工具执行流水线，不是模型 turn 循环。它内部还可能调用
+`ToolOrchestrator`（`core/src/tools/orchestrator.rs:125`）完成“审批 → 选 sandbox → 尝试 →
+必要时升级 sandbox 重试”。`exec_command`、`apply_patch` 等进程工具的 handler 会走这条路径；
+MCP 或纯内存工具不一定使用同一个 orchestrator。
+
+关键点是：**orchestrator 的一次 sandbox 重试仍属于同一个 `ToolCall`**。它不会重新进入模型循环，
+也不会生成第二个 function call；模型最终只看到这次调用的一份最终输出。审批和安全策略的细节留到 §8。
+
+#### c. 并发规则：read 锁并行，write 锁独占
+
+是否允许并行由工具 runtime 声明：
+
+```text
+router.tool_supports_parallel(call)
+  → Registry::supports_parallel_tool_calls(tool_name)
+  → ToolExecutor::supports_parallel_tool_calls()
+```
+
+`supports_parallel == true` 时拿 `RwLock` 的 read guard，多个调用可以同时运行；
+否则拿 write guard，和所有其它工具互斥。当前典型取值：
+
+| 工具 | 并行 | 原因 |
+|---|---:|---|
+| `exec_command` | ✅ | 允许同时发起多个独立命令 |
+| `write_stdin` | ✅ | 可以并行轮询/写入不同 terminal session |
+| `view_image` | ✅ | 只读 |
+| `web.run` | ✅ | 搜索调用独立 |
+| `tool_search` | ✅ | 纯本地目录检索 |
+| 默认 MCP 工具 | ❌ | 除非 server 显式 opt-in |
+| MCP `readOnlyHint` 工具 | ✅ | server 声明只读时可以并行 |
+| `apply_patch` | ❌ | 修改共享工作区，需要独占 |
+
+注意这里没有另设一个“最多同时 N 个工具”的 semaphore。实际的 fan-out 上限就是
+模型在一个响应里发出的、可并行工具的调用数量；非并行调用则通过读写锁形成顺序屏障。
+
+`exec_command` 声明支持并行，并不代表它能证明每条 shell command 都是只读的。并发门是
+**工具级声明**，不是逐条命令分析；`cargo test`、`git status`、文件生成脚本之间的冲突仍要靠
+模型选择、approval、sandbox 和命令本身的行为约束收敛。
+
+#### d. `FuturesOrdered`：并行执行，但按调用顺序回灌
+
+`in_flight` 的类型是 `FuturesOrdered<InFlightFuture>`（`core/src/session/turn.rs:2589`）。
+它会轮询所有未完成 future，但只按**加入顺序**向下游产出结果。
+
+设模型依次返回 A、B、C：
+
+| 时间 | 事件 | 模型历史 |
+|---|---|---|
+| t0 | A、B 开始 | — |
+| t1 | B 完成，实际结果 ready | 等待 A |
+| t2 | A 完成 | 先记录 A 的输出 |
+| t3 | B 已缓存，立刻取出 | 再记录 B 的输出 |
+
+因此执行完成事件可以是 `B → A`，但模型下一轮看到的工具结果一定是 `A → B`。
+`call_trace::result_ready` 在 handler 真正完成时立即记录（`core/src/tools/parallel.rs:233`），
+用于观察真实延迟；模型上下文则依赖 `FuturesOrdered` 保持稳定顺序。
+
+如果模型显式返回 `cargo test` 和 `rg` 两个 `exec_command`，它们也可以在响应流结束后同时进入
+各自的子进程：`cargo test` 不会“触发”后面的 `rg`，`rg` 也不是在轮询测试状态；它只是另一个独立的
+read-lock 工具调用，开始扫描文件。若 `rg` 先完成、`cargo test` 后完成，`rg` 的输出会先 ready，
+但不会先进入模型历史，仍要等 `cargo test` 的结果按调用顺序落盘。
+
+这里说的是**允许并发执行**，不是保证并发一定更快：两个命令可能争用 CPU、构建目录、锁文件或网络。
+并发门只决定 async tool call 能否重叠，不能替命令判断内部资源冲突。
+
+这解决了两类不同需求：
+
+- 用户界面希望尽快显示哪个命令先跑完；
+- 模型协议要求 `call_id` 和对应结果不能因为完成顺序不同而错位。
+
+#### e. 并行是否可用的上游条件
+
+`build_prompt` 设置 `parallel_tool_calls: true`（`core/src/session/turn.rs:1598`），
+响应请求会把它发给模型。因此在常规 Responses 路径里，模型可以把多个独立调用放在同一响应。
+Responses Lite 等路径会在 client 层关闭该提示（`core/src/client.rs:1001`）。
+
+模型被允许并行，并不意味着执行端一定并行：
+
+- 模型可以只返回一个调用；
+- 多个工具中只要包含默认不并行的工具，就会触发独占写锁；
+- MCP read-only hint、server opt-in、模型能力与 feature 都会影响最终声明；
+- 用户中断可能让调用在等到锁之前就被取消。
+
+#### f. 结果如何回灌给模型
+
+正常路径使用 `ToolOutput::to_response_item`，再包装成 `ResponseItemEnvelope`。不同 payload 对应不同响应类型：
+
+- function → `function_call_output`；
+- custom/freeform → `custom_tool_call_output`；
+- client tool search → `tool_search_output`。
+
+如果 handler 返回 `FunctionCallError::RespondToModel`，`failure_response`
+（`core/src/tools/parallel.rs:303`）会构造一条可回灌的失败结果。普通 function 和 custom tool
+的 `success` 为 `false`；`tool_search` 是例外，它返回一个空的 `tool_search_output`。例如：
+
+- 模型调用了当前工具表里不存在的名字；
+- 参数 JSON 无法解析；
+- MCP 服务返回一次可纠正的错误；
+- pre-tool hook 拒绝了这次调用。
+
+这些错误不会立刻终止进程，而是进入历史，让模型看到“为什么失败”，再决定改参数、换工具或停止。
+
+`FunctionCallError::Fatal` 不同。它代表路由错误、handler 不可恢复、task join 失败等 host 级问题；
+`handle_tool_call` 会转成 `CodexErr::Fatal`（`core/src/tools/parallel.rs:108`），不再伪装成一份
+可以继续推理的普通工具结果。drain 阶段对这类错误使用 `error_or_panic`：debug 构建直接暴露，
+release 构建记录错误。判断标准不是“命令退出码是否为 0”，而是“模型还能不能通过看到错误自行修正”。
+
+所有成功/可纠正结果写入历史后，`try_run_sampling_request` 返回
+`SamplingRequestResult { needs_follow_up: true, .. }`。外层 `run_turn` 重新捕获 step、重新发出模型请求；
+历史里现在有原始调用和它对应的输出，模型可以继续下一步。
+
+#### g. 取消、中断与 abort
+
+每次工具调用拿到 turn cancellation token 的 child token。`handle_tool_call_with_source`
+用 `tokio::select!` 同时等待：
+
+- tool dispatch task 完成；
+- cancellation token 取消。
+
+取消先到时，会先检查 `terminal_outcome_reached`，避免“结果已经完成但取消也同时到达”把已完成结果丢掉；
+仍未完成时才 `abort()` dispatch task，并合成 `AbortedToolOutput`
+（`core/src/tools/parallel.rs:250`）。它会通知 lifecycle `ToolCallOutcome::Aborted`
+（`core/src/tools/lifecycle.rs:122`），然后仍把一条“aborted by user”结果写回历史。
+
+这使 turn 中断后恢复时有完整结构：调用 item 存在，对应 output 也明确标注被取消，而不是留下悬空 `call_id`。
+
+两个 feature 改变中断体验：
+
+- `InstantInterrupt`：`StepContext.preempt` 监听 turn 内的新用户输入；等待模型流时可以被输入抢占，
+  已收到的调用仍按正常 drain 收尾，下一轮再处理新输入；
+- `CodeModeInterrupt`：用户中断 turn 时，调用 `interrupt_active_cells()` 终止仍在运行的 Code Mode cell；
+  task 先给 100ms 优雅退出窗口，再 abort 运行任务。
+
+这些机制都围绕同一个原则：**取消结果也必须结构化地回到历史**。
+
+#### h. 控制类工具与普通工具
+
+`CoreToolRuntime::is_builtin_control_tool()` 会标记 `request_user_input`、plan、sleep、
+部分异步消息工具等控制类调用。它本身不改变上面的调度算法，主要作用是生成专门的
+control-tool analytics 状态（completed / rejected / failed）。
+
+控制工具之所以看起来“阻塞”或“暂停”，来自 handler 本身：例如 `request_user_input` 要等客户端回复；
+它默认也不声明并行，因此以 write lock 独占执行。控制工具和普通工具共享同一个 `ToolCall`、
+取消、错误和结果回灌协议。
+
+#### i. Code Mode：一个外层调用里套很多内层调用
+
+普通 direct 模式下，模型请求几个工具，`FuturesOrdered` 就管理几个 future。
+Code Mode 则把拓扑变成了两层：
+
+```text
+模型
+  └─ exec（一个普通 tool call）
+       └─ JavaScript cell
+            ├─ tools.exec_command(...)
+            ├─ tools.exec_command(...)
+            └─ tools.view_image(...)
+```
+
+`CodeModeDispatchBroker` 接收 runtime 发来的 nested invocation，等对应 cell ready 后，
+交给 `CoreTurnHost::submit_tool`；后者仍然调用 `ToolCallRuntime::handle_tool_call_with_source`，
+只是 `ToolCallSource` 标成 `CodeMode { cell_id, runtime_tool_call_id }`。
+
+这意味着嵌套调用复用了同一套 registry、并发门机制、hook、取消和 ToolOutput 转换，
+但**不会各自生成一条 top-level model tool call**。模型看到的是外层 `exec` 的汇总输出；
+每个 nested call 的身份和结果通过 `executed_tool_calls` 记录到请求 metadata/rollout trace。
+
+Code Mode 的一个 cell 可以 yield，稍后由 `wait` 工具继续，因此 nested 调用可能跨多次顶层工具调用存活。
+外层 `exec` future 结束不等于所有 Code Mode worker 都结束；cell 生命周期由 broker 的
+dispatch gate 和 `wait`/`terminate` 管理。
+
+#### j. 另一条账本和事件流
+
+模型历史记录的是“继续推理需要看到的内容”；`ExecutedToolCalls`
+（`core/src/tools/executed_tool_calls.rs:253`）记录的是另一份有界审计账本：
+
+- 参数单条最多保存 8 KiB，超出就标记 truncated；
+- 单次 output 最多附带的完整参数总量 32 KiB；
+- pending nested call/cell 数量最多 256；
+- recorder 只记录，不 dispatch、不 await。
+
+工具事件也分成两条：
+
+- `ToolEmitter` 产生用户可见的 command/patch begin/end 事件（`core/src/tools/events.rs:215`）；
+- `ToolLifecycleContributor` 提供 host 观察生命周期、MCP result、timing 的 hook
+  （`core/src/tools/lifecycle.rs:21`）。
+
+它们都可能按真实完成顺序出现，和按调用顺序写入模型历史是两套不同的“顺序”。
+
+#### k. 循环何时继续，何时结束
+
+一次采样得到工具调用时，`needs_follow_up` 至少为 `true`。drain 完成后，
+`run_turn` 回到 turn 级循环，重新采样。
+
+没有工具调用时还有两个条件：
+
+- `ResponseEvent::Completed.end_turn == false` 仍会触发继续（`core/src/session/turn.rs:2995`）；
+- steer/queued input 非空也会让 turn 继续。
+
+只有没有新工具调用、模型允许结束、且没有待处理输入时，turn 才进入 Stop hooks 和最终收尾。
+所以“工具循环”不是独立于 turn 的 daemon，而是 `run_turn` 内部围绕采样和工具结果的一轮轮往返。
 
 ### ④ 取舍
 
-- 并行带来的确定性损失，怎么用事件顺序弥补
-- 为什么错误要分成"回给模型"和"崩掉"两类
+**为什么等流结束才执行工具。** 立即执行能更早返回第一个结果，但模型可能还在继续追加工具调用；
+先完整收集调用，能让 host 在执行前知道这一批操作的全貌。代价是所有工具都要等模型响应结束后才启动，
+首字节和首个工具结果之间多了一段串行等待。
+
+**为什么并行执行却按顺序回灌。** `FuturesOrdered` 同时满足吞吐和协议确定性：底层 future 并发推进，
+对外仍按调用顺序产出。代价是快调用必须等前面的慢调用才能进入历史，实际已完成结果会被暂存。
+
+**为什么用一把读写锁，而不是按文件或资源锁。** 工具只知道自己的粗粒度并行声明，host 并不知道
+每条 `exec_command` 会访问哪些路径；用一把 gate 简单且可预测。代价是两个完全独立的只读工具，
+只要其中一个没声明并行，也会被串行化；反过来，两个并行 shell 仍可能互相修改同一文件。
+`cargo test` 和 `rg` 可以重叠运行，也只表示两个进程都被允许启动，不表示 `rg` 是由测试派生出来的后台任务。
+
+**为什么没有固定并发 semaphore。** 模型一次响应里的工具数量本身有限，工具也各自声明并行能力。
+再加一层固定上限会增加调度延迟并掩盖真正的问题。代价是极端响应可能一次启动很多 read-lock 工具，
+需要靠响应上限、hook、policy 和 provider 约束共同控制。
+
+**为什么错误要分成“回给模型”和“Fatal”。** 模型需要知道参数写错、名字写错、服务临时拒绝，
+这样才能修正；host 内部路由或 task 损坏则没有可纠正的模型动作。把所有错误都回给模型会制造无效重试，
+把所有错误都 Fatal 又会让一次普通命令失败直接杀掉 turn。
+
+**为什么 Code Mode 不生成多个顶层调用。** 一个 `exec` 脚本可以把控制流、过滤和多次工具调用的组合
+留在 runtime 内，减少模型往返和上下文体积。代价是外层输出变成汇总视图，nested 身份必须靠 metadata
+和 trace 保留；取消和 cell 生命周期也更复杂。
+
+回到主流程：§7 结束时，所有本批工具结果已经按模型调用顺序写入历史，turn 要么进入下一次采样，
+要么正常结束。下一节转向这条链路中最敏感的部分：哪些调用在执行前会被审批、execpolicy、
+sandbox 或 Guardian 拦下，以及这些决定如何变成模型可见的结果。
 
 ---
 
