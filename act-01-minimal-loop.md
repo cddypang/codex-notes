@@ -1819,42 +1819,94 @@ AGENTS.md 里那几条硬规则可以对着看：
 
 ### ① 问题
 
-会话状态每轮都在变（权限、工具表、插件、环境……），如果每轮全量重发，代价是什么？
+上一节最后落到一句话：**上下文组装发生在"写历史"的时候**。`run_turn` 每圈会写好几样东西，
+其中最容易漏掉、也最特殊的一样，就是本节的主角——world state（模型可见的运行状态）。
 
-先算一笔账。模型 API 是按输入 token 计费的，而且服务端有 **prompt cache**：如果这次请求
-的前缀和上次一样，前缀部分可以命中缓存、便宜且快。
-
-而模型看到的上下文是**只能追加的**（上一节的结论）。这意味着：
+它特殊在哪？看它装的东西：权限、工具表、插件、环境、AGENTS.md、协作模式……这些**每轮都可能变**。
+而历史只能追加（§4 的结论），所以：
 
 > 每往历史里追加一条新内容，从那条往后，所有前缀都变了。
 
-如果每轮都把"当前权限、工具表、插件、环境、AGENTS.md……"整套重发一遍，那么每一轮
-都会追加一大批新 item —— 上一轮缓存的前缀全部作废，而且每轮都要为这些重复内容付费。
+模型 API 按输入 token 计费，服务端还有 **prompt cache**：只有前缀和上次一样才能命中。如果每轮
+把"当前权限、工具表、插件、环境、AGENTS.md……"整套重发一遍，那么每一轮都会追加一大批新 item
+——上一轮缓存的前缀全部作废，而且每轮都要为这些重复内容付费。
 
 所以问题变成：**状态每轮都在变，怎么做到"只发变化的部分"？**
 
-这一节讲的就是答案——`WorldState`。
+答案就是 `WorldState`：把状态按"类"切成 section（权限、工具表、环境、AGENTS.md……各算一个），
+每个 section 有稳定 ID，每轮只渲染和上一份快照的**差异**。
 
 ### ② 代码入口
 
+它不是独立启动的模块，而是 §4 那张【写】清单里的一行。回到 `run_turn` 的 `loop`
+（`core/src/session/turn.rs:426`），在【读】之前：
+
 ```text
-codex-rs/core/src/context/world_state/mod.rs:226     # WorldStateSection trait
-codex-rs/core/src/context/world_state/mod.rs:208     # PreviousSectionState 三态
-codex-rs/core/src/context/world_state/mod.rs:285     # WorldState（section 容器）
-codex-rs/core/src/context/world_state/mod.rs:292     # WorldStateSnapshot
-codex-rs/core/src/context/world_state/mod.rs:313     # merge_patch_from / apply_merge_patch（RFC 7386）
-codex-rs/core/src/context/world_state/mod.rs:415     # render_history_diff
-codex-rs/core/src/context/world_state/               # 19 个内置 section 实现
-codex-rs/core/src/session/world_state.rs:40          # build_world_state_for_step
-codex-rs/core/src/session/mod.rs:3607                # record_step_world_state_if_changed
-codex-rs/core/src/context_manager/history.rs:446     # update_world_state / set_world_state_baseline
+core/src/session/turn.rs:507
+  world_state = sess.record_step_world_state_if_changed(&world_state, step_context).await?;
 ```
+
+把这一行展开，就是本节的全部内容（仍然是 `--no-daemon` 那条单进程调用链上的函数调用）：
+
+```text
+core/src/session/turn.rs:507           每圈采样请求之前调用一次
+  └─ core/src/session/mod.rs:3607      record_step_world_state_if_changed
+       ├─ 采集   core/src/session/world_state.rs:40     build_world_state_for_step
+       │          ├─ 17 个内置 section
+       │          │    core/src/context/world_state/*.rs（16 个）
+       │          │    + core/src/context/token_budget_context.rs
+       │          └─ extensions 的 context_contributors()（扩展 section）
+       ├─ 对比   core/src/context/world_state/mod.rs:415  render_history_diff
+       │          └─ 每个 section 自己的 render_diff（见 ③c）
+       ├─ 写历史 core/src/session/mod.rs:3461            record_conversation_items（给模型）
+       ├─ 换基准 core/src/context_manager/history.rs:465  set_world_state_baseline
+       └─ 写盘   RolloutItem::WorldState                   persist_rollout_items（给 resume）
+```
+
+**生命周期**：这里必须区分两个东西——`run_turn` 手里的 **live 值**，和历史里记的 **baseline**。
+
+| 东西 | 谁持有 | 活多久 |
+|---|---|---|
+| `Arc<WorldState>`（live 值） | `run_turn` 的局部变量 `world_state` | **turn 内**：282 行建、每圈 507 行换、`run_turn` 返回即销毁 |
+| `WorldStateSnapshot`（baseline） | `SessionState.history.world_state_baseline` | **跨 step、跨 turn**；`resume` 时从 rollout 重建 |
+| `RolloutItem::WorldState`（full / patch） | rollout 文件 | **跨进程** |
+
+代码里有一句注释把这个分工说得很直白（`codex-rs/core/src/session/mod.rs:3633`）：
+
+> ContextManager remembers this for later turns; run_turn owns the live value.
+
+具体时间线：
+
+```text
+run_turn 开始
+  ├─ 282  world_state = record_context_updates_and_set_reference_context_item(first_step)
+  │        └─ build_world_state_for_step(...) -> Arc<WorldState>
+  │           需要全量重建时（reference context item 为空）写 full snapshot；
+  │           否则和 history baseline 比较，有变化才写 patch
+  ├─ 308  let mut world_state = world_state?;        ← turn 本地值诞生
+  ├─ 356  （仅 guardian 压缩后）重建一次：历史被重置了
+  ├─ loop 每圈
+  │    └─ 507  world_state = record_step_world_state_if_changed(&world_state, step)
+  │             └─ 新建一个 Arc<WorldState>，和上一圈的 live 值比较；
+  │                写历史、更新 baseline、写 patch；旧的 Arc 在这里失去最后一个引用
+  ├─ 620/783  需要压缩时 Arc::clone(&world_state) 交给 run_auto_compact
+  └─ run_turn 返回 → 局部 world_state 销毁
+                     baseline 留在 history 里，供下一个 turn 用；
+                     full / patch 留在 rollout 里，供 resume 用
+```
+
+**时机**：每圈采样请求之前都会跑一次；但**只有差异非空时才真的写**（见 ③c 的 `None`）。
+所以它是"按步发生、按需落地"，不是启动时初始化一次的东西。
+
+**结论**：`WorldState` 对象是 **turn 级临时值**；它体现的"状态"是 **thread 级持久数据**
+（history 里的 baseline + rollout 里的 full/patch）。下一个 turn 开始时，`run_turn` 会重新
+build 一个 `WorldState`，再和持久化的 baseline 比较——而不是把上一轮的 `Arc<WorldState>` 直接传进来。
 
 ### ③ 关键设计
 
-#### a. 三段式：build → diff → record
+#### a. 放大这一步：build → diff → record / persist
 
-每一轮采样请求，world state 只走三步（`session/mod.rs:3607`）：
+`record_step_world_state_if_changed`（`core/src/session/mod.rs:3607`）的全文就是三段：
 
 ```rust
 pub(crate) async fn record_step_world_state_if_changed(&self, previous_world_state, step_context) {
@@ -1890,12 +1942,59 @@ pub(crate) async fn record_step_world_state_if_changed(&self, previous_world_sta
 | `items` → `record_conversation_items` | **模型** | 渲染好的文本片段，追加进历史 |
 | `world_state_item` → `persist_rollout_items` | **resume / 重启** | JSON merge patch，写进 rollout |
 
-这个双轨设计是本节最容易被忽略的一点：**模型看的是文字，rollout 存的是结构化数据。**
-两者都是从同一对 snapshot 推出来的，所以不会不一致。
+这是本节最容易被忽略的一点：**模型看的是文字，rollout 存的是结构化数据。** 两者都是从同一对
+snapshot 推出来的，所以不会各说各话。
 
-#### b. `WorldStateSection`：每个 section 自己决定"怎么渲染差异"
+#### b. 采集：`build_world_state_for_step` 把 section 装进 `WorldState`
 
-trait 定义在 `context/world_state/mod.rs:226`：
+先说清楚 **section** 是什么：它不是通用容器，而是"一类模型可见状态"的实现单元——权限、工具表、
+环境、AGENTS.md……每一种都实现一次 `WorldStateSection` trait（见 ③c），声明自己的稳定 ID 和
+比较用的 Snapshot 类型。`WorldState` 本身只是一个有序容器：
+
+```rust
+pub(crate) struct WorldState {
+    sections: IndexMap<&'static str, Box<dyn ErasedWorldStateSection>>,
+}
+```
+
+`IndexMap` 保序，所以 section 的排列顺序是确定的、有语义的（这一节后面会看到为什么顺序不能乱）。
+
+`build_world_state_for_step`（`core/src/session/world_state.rs:40`）把这一圈的 17 个内置 section 逐个
+`add_section(...)` 进 `WorldState`。开头先重现了一遍 §4 ③f 的裁剪规则：
+
+```rust
+let model_instructions = render_model_instructions(model_info);
+let model_instructions = if !turn_context.config.update_plan_enabled
+    && turn_context.config.model_catalog.is_none()
+    && (turn_context.config.base_instructions.is_none()
+        || matches!(turn_context.config.base_instructions_provenance,
+                    Some(BaseInstructionsProvenance::Model { .. })))
+{
+    codex_prompts::without_update_plan_instructions(&model_instructions)
+} else {
+    model_instructions
+};
+let base_instructions = self.get_prompt_base_instructions().await.text;
+```
+
+——和 §4 里 `get_prompt_base_instructions` 是同一条规则，两处都要用，所以两处都写了一遍。
+
+**顺序即语义**：section 在历史里的排列顺序会影响模型的理解，所以装配顺序是写死的，不是随手插。
+扩展 section 走 `add_extension_section`（`core/src/context/world_state/mod.rs:367`），其中 `host_skills` 被硬编码插到
+`permissions` 前面：
+
+```rust
+if id == "host_skills" && let Some(index) = self.sections.get_index_of(PermissionsState::ID) {
+    self.sections.shift_insert(index, id, section);   // ← 插到 permissions 前面
+} else {
+    self.sections.insert(id, section);
+}
+```
+
+#### c. 每个 section 自己决定怎么渲染差异
+
+采集只是把状态摆好。真正决定"这一轮要不要告诉模型"的，是每个 section 自己的 `render_diff`。
+trait 定义在 `core/src/context/world_state/mod.rs:226`：
 
 ```rust
 pub(crate) trait WorldStateSection: Send + Sync + 'static {
@@ -1926,14 +2025,10 @@ pub(crate) trait WorldStateSection: Send + Sync + 'static {
 - **`Snapshot` 不是状态本身，是"比较用的数据"**。它可以比真实状态小得多。
 - **不能序列化成 `null`**，因为 RFC 7386 里 null 表示"删除"。
 
-内置 section 一共 19 个（`context/world_state/`），包括 `permissions` / `tools` /
-`plugins_instructions` / `agents_md` / `environment` / `multi_agent_mode` / `realtime` /
-`collaboration_mode` / `persistent_mode` 等。每个都是独立文件，独立 `snapshot` 类型。
-
 `render_diff` 的返回值是 `Option`——**返回 `None` 表示"这轮这片状态没变，不需要发"**。
 这就是"增量"的实现方式：不是发一个空的差异，而是压根不产生 item。
 
-看一个真实例子（`world_state/permissions.rs:94`）：
+看一个真实例子（`core/src/context/world_state/permissions.rs:94`）：
 
 ```rust
 fn render_diff(&self, previous: PreviousSectionState<'_, Self::Snapshot>)
@@ -1954,7 +2049,9 @@ fn render_diff(&self, previous: PreviousSectionState<'_, Self::Snapshot>)
 ——每个 section 的差异逻辑都是**手写的**，没有通用框架。这是刻意的：只有它自己知道
 "哪部分变了才值得告诉模型"。
 
-#### c. `PreviousSectionState` 三态：为什么需要 `Unknown`
+#### d. 三态：为什么需要 `Unknown`
+
+比较的基准不总是存在。`PreviousSectionState`（`core/src/context/world_state/mod.rs:208`）把情况分成三态：
 
 ```rust
 pub(crate) enum PreviousSectionState<'a, T> {
@@ -1975,7 +2072,7 @@ pub(crate) enum PreviousSectionState<'a, T> {
 | `Known` | 有精确的上一份 snapshot | 走真正的差异渲染 |
 | `Unknown` | **历史里有这段内容，但拿不到结构化 snapshot** | 见下 |
 
-`Unknown` 是给**旧 rollout** 准备的。判据在 `render_history_diff`（`:415`）：
+`Unknown` 是给**旧 rollout** 准备的。判据在 `render_history_diff`（`core/src/context/world_state/mod.rs:415`）：
 
 ```rust
 } else if has_legacy_fragment(items.clone(), section) {
@@ -1986,12 +2083,12 @@ pub(crate) enum PreviousSectionState<'a, T> {
 ```
 
 如果 snapshot 丢了（比如历史被压缩），但扫描保留的历史 item 还能认出这条 section 曾经发过
-（靠上一节讲的 `markers()` / `matches_legacy_fragment`），那就标成 `Unknown`。
+（靠 §4 讲的 `markers()` / `matches_legacy_fragment`），那就标成 `Unknown`。
 
 **`Unknown` 的意义**：既不能当作"没发过"去全量重发（会重复），也不能当作"已知"去做差异
 （没有基准）。所以 section 必须自己处理这一态——通常是"按当前状态全量发一次，重建基准"。
 
-还有第五种情况藏在上面的代码里（`:417`）：
+还有第五种情况藏在上面的代码里（`core/src/context/world_state/mod.rs:417`）：
 
 ```rust
 if section.has_retained_fragment_matcher()
@@ -2004,7 +2101,10 @@ if section.has_retained_fragment_matcher()
 ——**snapshot 说有，但历史里已经没了**（被压缩擦掉）。这种情况必须降级成 `Absent`，
 否则模型会以为自己看过这段内容，而实际上没有。这是"snapshot 和历史可能不同步"的兜底。
 
-#### d. `WorldStateSnapshot` 与 RFC 7386 merge patch
+#### e. 第二轨：快照与 RFC 7386 merge patch
+
+给模型的那一轨（③a 的 `items`）是文字；给 resume 的那一轨需要一个可增量、可回放的结构。
+`WorldStateSnapshot` 就是后者：
 
 ```rust
 pub(crate) struct WorldStateSnapshot {
@@ -2012,11 +2112,22 @@ pub(crate) struct WorldStateSnapshot {
 }
 ```
 
-它要解决的是"怎么把这份快照存进 rollout，且增量存储"。答案是 RFC 7386 的 JSON Merge Patch：
+它要解决的是"怎么把这份快照存进 rollout，且增量存储"。
+
+先把名词解释掉：**RFC 7386 就是 "JSON Merge Patch" 的标准**——用一段局部 JSON 描述"如何把旧文档
+改成新文档"：对象里出现的字段覆盖旧值，值为 `null` 表示删除该字段，数组则整体替换。用它来存状态，
+就不必每步存整份 snapshot，只存"从上一份到这一份的变化"。示意：
+
+```text
+上一份            当前                 merge patch
+{"a": 1, "b": 2}  ->  {"a": 1, "c": 3}  ->  {"b": null, "c": 3}
+```
+
+对应到代码就是这两个函数：
 
 ```rust
-pub(crate) fn merge_patch_from(&self, previous: &Self) -> Option<Map<String, Value>> { ... }
-pub(crate) fn apply_merge_patch(&mut self, patch: &Map<String, Value>) { ... }
+pub(crate) fn merge_patch_from(&self, previous: &Self) -> Option<Map<String, Value>> { ... }  // 算 patch
+pub(crate) fn apply_merge_patch(&mut self, patch: &Map<String, Value>) { ... }                // 回放 patch
 ```
 
 两个实现细节值得注意：
@@ -2026,12 +2137,11 @@ pub(crate) fn apply_merge_patch(&mut self, patch: &Map<String, Value>) { ... }
 - **数组整体替换**。`remove_null_object_fields` 的注释：
   *"RFC 7386 reserves object-valued nulls for deletion, but arrays are replaced whole."*
 
-回到上面的双轨设计：`merge_patch_from` 的结果既是**给模型看的历史差异**（`render_history_diff`），
-也是**写进 rollout 的补丁**（`WorldStateItem::patch`）。同一个函数，两个消费者。
+回到 ③a 的双轨设计：`merge_patch_from` 的结果既是**写进 rollout 的补丁**
+（`WorldStateItem::patch`），而给模型看的那一侧由 `render_history_diff` 用同一对 snapshot 生成。
+同一对 snapshot，两个消费者。
 
-#### e. `WorldStateHash`：当"渲染结果"本身就是状态
-
-`WorldStateHash`（`:265`）是个 SHA-1 指纹，基于 `role()` + `render()` 计算：
+**特例：`WorldStateHash`**（`core/src/context/world_state/mod.rs:265`）是个 SHA-1 指纹，基于 `role()` + `render()` 计算：
 
 ```rust
 pub(crate) struct WorldStateHash(String);
@@ -2042,21 +2152,53 @@ impl WorldStateHash {
 ```
 
 它不是全局的去重机制，而是**给某些 section 当 `Snapshot` 类型用**。看
-`multi_agent_usage_hint.rs:22`：
+`core/src/context/world_state/multi_agent_usage_hint.rs:20`：
 
 ```rust
 type Snapshot = WorldStateHash;
 ```
 
 ——这类 section 的"有意义的状态"就是渲染出来的那段文字。存原文浪费，存哈希就够：
-对比时只要哈希相同，就说明这轮不用发。
+对比时只要哈希相同，就说明这轮不用发。代价是**无法从 patch 反推内容**——所以这类 section 在
+resume 时只能靠历史里的片段重建，这正是 `Unknown` 存在的理由之一。
 
-用哈希而不是对比文本，是因为哈希写入 rollout 后体积可控；但代价是**无法从 patch 反推内容**
-——所以这类 section 在 resume 时只能靠历史里的片段重建，这正是 `Unknown` 存在的理由之一。
+#### f. 恢复时怎么用：resume 回放 patch
 
-#### f. 扩展怎么加 section
+rollout 里存的是"full snapshot + 一串 patch"。`resume` 时按时间顺序回放
+（`core/src/session/rollout_reconstruction.rs:485–500`）：
 
-两条接口（`ext/extension-api`）：
+```rust
+world_state_replay.reverse();                       // 收集时是倒序的，先翻回正序
+let mut world_state_baseline: Option<WorldStateSnapshot> = None;
+for item in world_state_replay {
+    match item {
+        RolloutItem::Compacted(_) => world_state_baseline = None,          // 压缩：基准作废
+        RolloutItem::WorldState(ws) if ws.full => {
+            world_state_baseline = Some(WorldStateSnapshot::from(&ws.state));
+        }
+        RolloutItem::WorldState(ws) => {
+            let Some(baseline) = world_state_baseline.as_mut() else {
+                tracing::warn!("ignored world-state patch without a full snapshot");
+                continue;
+            };
+            baseline.apply_merge_patch(&ws.state);
+        }
+        ...
+    }
+}
+```
+
+三个要点：
+
+- 必须先有 full snapshot 才能应用 patch；孤立的 patch 会被丢弃并告警。
+- 压缩会让基准作废（`Compacted` → `None`），之后的 patch 要等下一份 full snapshot。
+- 回放出来的 `world_state_baseline` 交给下一轮 `record_step_world_state_if_changed` 当
+  `previous`——于是"模型上次看到的是哪一版"在 resume 之后仍然可比较。
+
+#### g. 扩展怎么加 section
+
+扩展不直接往 `WorldState` 里塞东西，而是实现 `ContextContributor` 的两个接口
+（`ext/extension-api`）：
 
 ```rust
 // 贡献 section
@@ -2079,45 +2221,8 @@ fn retain_world_state_after_compaction(
 也就是：压缩会丢掉渲染文本，但扩展可以把自己 section 的**决策数据**保留下来，
 这样下一轮不用重新做一遍判断。
 
-注入点在 `WorldState::add_extension_section`（`:367`），里面有一段特例：
-
-```rust
-if id == "host_skills" && let Some(index) = self.sections.get_index_of(PermissionsState::ID) {
-    self.sections.shift_insert(index, id, section);   // ← 插到 permissions 前面
-} else {
-    self.sections.insert(id, section);
-}
-```
-
-——`host_skills` 被硬编码到特定位置。这是"顺序即语义"的体现：section 在历史里的顺序会影响
-模型的理解，所以顺序不能随便。
-
-#### g. 内置 section 的构建
-
-`build_world_state_for_step`（`session/world_state.rs:40`）是这个大函数。开头就能看到它
-在反复处理同一个问题：
-
-```rust
-let model_instructions = render_model_instructions(model_info);
-let model_instructions = if !turn_context.config.update_plan_enabled
-    && turn_context.config.model_catalog.is_none()
-    && (turn_context.config.base_instructions.is_none()
-        || matches!(turn_context.config.base_instructions_provenance,
-                    Some(BaseInstructionsProvenance::Model { .. })))
-{
-    codex_prompts::without_update_plan_instructions(&model_instructions)
-} else {
-    model_instructions
-};
-let base_instructions = self.get_prompt_base_instructions().await.text;
-```
-
-——和上一节 §4e 里 `get_prompt_base_instructions` 的那段裁剪逻辑是同一条规则，
-在两处都要用，所以两处都写了一遍。
-
-它接着按顺序 `add_section(...)` 把 19 个 section 依次装配进 `WorldState`，
-最后遍历 `context_contributors()` 把扩展的 section 也加进去
-（就是第二幕 §10 里讲的那段代码）。
+采集时这些贡献由 `build_world_state_for_step` 统一收进 `WorldState`（③b 的
+`add_extension_section`），所以扩展的 section 和内置 section 走的是同一条 diff / record 路径。
 
 ### ④ 取舍
 
@@ -2127,7 +2232,7 @@ let base_instructions = self.get_prompt_base_instructions().await.text;
 
 代价同样具体，集中在三处：
 
-1. **每个 section 都要手写差异逻辑**（19 个内置 + 扩展），没有通用框架。
+1. **每个 section 都要手写差异逻辑**（17 个内置 + 扩展），没有通用框架。
 2. **多了一份必须保持同步的状态**：rollout 里的 snapshot 和模型历史里的文本。
    上面那两处兜底（`Unknown`、以及"snapshot 说有但历史里找不到就降级成 `Absent`"）
    就是在处理两者不同步的后果。
@@ -2156,6 +2261,10 @@ let base_instructions = self.get_prompt_base_instructions().await.text;
 代价是这个双轨必须**从同一对 snapshot 推出来**（代码里正是这么做的：同一个
 `previous` / `current` 分别喂给 `render_history_diff` 和 `merge_patch_from`），
 否则两边会不一致。
+
+**这一节和 §4 是什么关系？** 一句话：§4 说"组装发生在写的时候"，本节就是那个"写"里最大的一块。
+它每圈执行一次（`core/src/session/turn.rs:507`），但只有状态真的变了，才会在历史里留下一条 item、在 rollout 里
+留下一条 patch。
 
 ---
 
