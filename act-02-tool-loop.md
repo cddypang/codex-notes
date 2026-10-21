@@ -5,7 +5,7 @@
 >
 > **前置依赖**：第一幕（尤其是第 2 节的 turn 循环、第 4 节的上下文组装）。
 >
-> **状态**：第 6–7 节正文完成；第 8 节仍为大纲
+> **状态**：第 6–8 节正文完成
 
 ---
 
@@ -835,38 +835,360 @@ sandbox 或 Guardian 拦下，以及这些决定如何变成模型可见的结�
 
 ## 8. 审批与安全边界
 
-### ① 问题
+### ① 问题：一条危险命令会在哪一层被拦下
 
-模型决定执行 `rm -rf /`、读取 SSH 私钥、或者往生产环境发请求——谁拦？
+假设用户要求修改部署脚本，然后直接调用 staging API 验证。模型可能提出：
+
+```text
+[1] exec_command   rg -n "deploy" scripts/
+[2] apply_patch    修改 scripts/deploy.sh
+[3] exec_command   curl https://staging.example.com/health
+```
+
+再考虑两条越界路径：
+
+```text
+[4] exec_command   cat ~/.ssh/id_ed25519
+[5] exec_command   rm -rf /
+```
+
+这五条动作的风险并不在同一层：
+
+| 动作 | 主要风险 | 谁负责 |
+|---|---|---|
+| 搜索脚本 | 读取工作区 | filesystem sandbox |
+| 修改脚本 | 写入范围、diff 是否可信 | patch 校验 + sandbox + approval |
+| 请求 staging | 目标域名、协议、外发数据 | network proxy + approval |
+| 读取 SSH 私钥 | 敏感文件越权读取 | filesystem sandbox / policy |
+| `rm -rf /` | 破坏性命令、越过工作区 | execpolicy + approval + sandbox |
+
+所以“审批与安全边界”不是一道 `if dangerous { ask_user() }`。它是一组职责不同的闸门：
+
+- execpolicy 判断命令规则和危险模式；
+- approval policy 决定是否允许把这个请求交给 reviewer；
+- Guardian 或用户给出批准、拒绝或中止；
+- sandbox 在执行时真正限制文件、进程和网络能力；
+- network proxy 对实际连接目标再做一次主机级裁决。
+
+其中任何一层都不能替代另一层。审批通过不自动等于获得更宽的权限；
+权限仍由 host 和 sandbox 落地。
 
 ### ② 代码入口
 
+主接点在 §7 的 `CoreToolRuntime::dispatch`。进入具体 handler 之前，registry 已经执行过 pre-tool hooks；
+这些 hook 可以阻断调用或重写参数，但它们不是“谁获得多少权限”的最终裁决。
+
+以 `exec_command` 为例，时间顺序是：
+
 ```text
-codex-rs/core/src/tools/approvals.rs
-codex-rs/core/src/exec_policy.rs                # execpolicy
-codex-rs/execpolicy/
-codex-rs/sandboxing/                            # 平台抽象
-codex-rs/core/src/guardian/                     # 审查
-codex-rs/guardian-context/src/lib.rs            # 可组合的审查上下文
-codex-rs/ext/guardian-v2/src/{sync_reviewer,async_scorer}
-codex-rs/core/src/tools/network_approval.rs
+exec_command handler
+  └─ core/src/unified_exec/process_manager.rs
+       ├─ ExecPolicyManager::create_exec_approval_requirement_for_shell
+       ├─ ToolOrchestrator::run（core/src/tools/orchestrator.rs:125）
+       │    ├─ 1. 解析审批要求
+       │    ├─ 2. request_approval（core/src/tools/approvals.rs:479）
+       │    │      ├─ permission-request hook
+       │    │      ├─ Guardian / ApprovalReviewContributor
+       │    │      └─ user approval event
+       │    ├─ 3. SandboxManager::select_initial
+       │    ├─ 4. first ToolRuntime::run
+       │    ├─ 5. sandbox denial → 可选 escalated retry
+       │    └─ 6. network proxy 内联审批
+       └─ ToolOutput / FunctionCallError
 ```
+
+`apply_patch` 走同一条 orchestrator 结构，但它的 runtime 直接使用文件系统 sandbox context，
+而不是启动 shell。MCP 工具则在 `McpHandler` 内先按 server/tool 的 approval mode 申请批准，
+再把 JSON-RPC 调用发给 MCP server。
 
 ### ③ 关键设计
 
-- `AskForApproval` 策略等级；审批请求的产生与裁决
-- `ApprovalReviewContributor::decide()`：**认领语义**（第一个返回 `Some` 的赢）
-- execpolicy：命令规则匹配（见 `docs/execpolicy.md`）
-- 沙箱层级：Seatbelt / Landlock / bubblewrap / Windows Sandbox——只讲它在流程里的位置，不展开平台实现
-- 提权路径：`shell-escalation`、`request_permissions`
-- Guardian：同步审查（阻断决策）+ 异步打分（风险评分）；`guardian-context` 的 section 组成与 token 预算；`ContextTarget::{Sync, Async}`
-- 网络策略：`network-proxy`、`network_policy_decision.rs`
+#### a. 两个正交配置：`AskForApproval` 与 `ApprovalsReviewer`
+
+`AskForApproval`（`codex-rs/protocol/src/protocol.rs:986`）决定“是否需要请求批准”：
+
+| 值 | 典型行为 |
+|---|---|
+| `never` | 不向用户展示审批请求；依赖 sandbox 执行，无法安全执行时直接失败 |
+| `on-request` | 默认策略；普通受限 sandbox 命令可直接尝试，在需要升级或规则要求时请求批准 |
+| `untrusted` | 未命中显式 allow rule 的命令都需要批准 |
+| `granular` | 按 sandbox/rules/skill/request-permissions/MCP elicitation 分别开关 |
+
+`never` 不等于“关闭 sandbox”，而是“关闭审批交互”。危险命令若既需要放行又无法被 sandbox 安全承载，
+结果会是 forbidden；网络请求也不会因此自动获得联网权限。
+
+`ApprovalsReviewer`（`codex-rs/protocol/src/config_types.rs:183`）决定“谁来审批”：
+
+- `user`：交给用户；
+- `auto_review`：交给 Guardian 自动审查。
+
+requirements 或 strict review 还可能要求某些模型、动作必须经过 Guardian。审批来源与是否允许审批
+是两个维度，不能合并成一个“安全模式”。
+
+#### b. execpolicy：先判断命令本身
+
+`ExecPolicyManager` 从 config layers 的规则目录加载 Starlark `.rules`，低优先级规则先加载，
+高优先级规则后覆盖；managed requirements 最终再叠加。
+
+常见规则形态：
+
+```python
+prefix_rule(pattern=["git", "status"], decision="allow")
+prefix_rule(pattern=["rm"], decision="forbidden")
+prefix_rule(pattern=["curl"], decision="prompt")
+```
+
+`prefix_rule` 的 pattern 是命令 token 前缀。`allow`、`prompt`、`forbidden` 分别表示无需审批、
+必须审批、直接拒绝。
+
+`create_exec_approval_requirement_for_shell` 会把 shell command 解析成实际命令段，
+包括 `bash -lc` 一类包装，再逐段交给 policy。最终结果映射为
+`ExecApprovalRequirement`（`core/src/tools/sandboxing.rs:153`）：
+
+- `Skip`：无需审批；
+- `NeedsApproval`：进入审批链；
+- `Forbidden`：不弹审批，直接返回拒绝原因。
+
+没有命中显式规则时，`render_decision_for_unmatched_command`
+（`core/src/exec_policy.rs:770`）根据 approval policy、filesystem sandbox 和危险命令启发式决定。
+例如 unrestricted 环境中的普通命令可能直接运行；受限 sandbox 中未要求升级的命令通常先让 sandbox 尝试；
+危险命令或“没有 sandbox 但由 managed policy 限制文件系统”的情况会提高为 prompt/forbidden。
+
+一个重要边界是：显式 `allow` 只有在**所有解析出的命令段**都命中 allow rule 时，才可能
+`bypass_sandbox=true`。`git status && curl ...` 不能因为前半段被 allow，就给整个复合命令放行。
+
+#### c. 审批链：hook 优先，其次是 Guardian/用户
+
+`Session::request_approval`（`core/src/tools/approvals.rs:479`）的优先级在代码注释里写得很明确：
+
+```text
+1. permission-request hooks
+2. StrictAutoReview / Guardian
+3. user
+```
+
+第一步是 request-specific permission hook，不是普通 pre-tool hook。它可以：
+
+- `Allow`：直接批准；
+- `Deny(message)`：直接拒绝并带上原因。
+
+没有 hook 裁决时，host 询问 Guardian。Guardian 不认领时，再按配置交给用户。
+`ApprovalReviewContributor` 的注册顺序有意义：`Registry::decide_approval`
+（`codex-rs/ext/extension-api/src/registry.rs:247`）返回**第一个 `Some`**，后续 contributor 不再执行。
+
+Guardian contributor 可以返回：
+
+- `Allow`：已有、仍然有效的风险证据足够支持放行；
+- `Reviewed(decision)`：同步审查给出明确决定；
+- `AskUser`：交给用户。
+
+`None` 表示“不认领”，不是隐式允许。没有 reviewer 且策略允许交给用户时走用户审批；
+strict auto review 则可以要求同步审查、超时或失败关闭。
+
+#### d. 审批决定会变成什么
+
+`ReviewDecision`（`codex-rs/protocol/src/protocol.rs:4159`）不只表示 approve/deny：
+
+| 决定 | 后续作用 |
+|---|---|
+| `Approved` | 只批准当前动作 |
+| `ApprovedForSession` | 写入 session approval cache，同类动作后续可跳过 |
+| `ApprovedExecpolicyAmendment` | 当前命令通过，并持久化新的 execpolicy 前缀规则 |
+| `ApprovedMcpPolicyAmendment` | 当前 MCP 调用通过，并持久化匹配工具策略 |
+| `NetworkPolicyAmendment` | 持久化该 host/protocol 的 allow 或 deny 规则 |
+| `Denied` | 当前调用失败，原因回灌给模型 |
+| `TimedOut` | 自动审查超时，按 fail-closed 处理 |
+| `Abort` | 不只是一个调用失败，整个 turn 中止 |
+
+session approval cache 只在 key 完全匹配时复用。`with_cached_approval`
+（`core/src/tools/sandboxing.rs:71`）要求所有相关 key 都已经是 `ApprovedForSession`；
+用户这次批准 session 后，代码会把同一个决定写到每个涉及文件的 key。
+
+这说明审批缓存不是“批准过任一命令就永久放行”。执行命令、patch 文件、MCP 工具和网络 host
+使用的是不同 key。
+
+#### e. sandbox：审批之后真正限制能力
+
+审批只决定“可以尝试”。`SandboxManager` 才决定进程以什么权限运行：
+
+| 平台 | `SandboxType` | 作用位置 |
+|---|---|---|
+| macOS | `MacosSeatbelt` | 包装子进程，限制文件/网络 |
+| Linux | `LinuxSeccomp` | 通过 sandbox helper/bubblewrap 等限制进程 |
+| Windows | `WindowsRestrictedToken` / `WindowsMxc` | restricted token 或 MXC sandbox |
+| 不需要 | `None` | policy 判断可以不加 platform sandbox |
+
+`SandboxManager::select_initial`（`codex-rs/sandboxing/src/manager.rs:310`）根据权限 profile、
+tool preference 和 managed network 选择 backend。`SandboxAttempt::env_for` 把 command 转成
+受 sandbox 包装的 exec request；`apply_patch` 则把同一份 filesystem sandbox context 传给 patch runtime。
+
+这里不展开各平台实现，只需记住位置：**sandbox 是执行时的强制边界，不是审批 UI 的附属字段。**
+即使模型解释“这是安全的”，只要文件或网络权限不在 profile 内，runtime 仍然会失败。
+
+#### f. sandbox denial 与升级重试
+
+第一次 attempt 失败不等于直接拒绝。`ToolOrchestrator` 会区分普通错误和
+`SandboxErr::Denied`（`core/src/tools/orchestrator.rs:381`）：
+
+1. 没有 sandbox denial：直接返回原错误；
+2. tool 不允许 escalation：返回 denial 输出；
+3. policy 不允许无 sandbox 重试：返回 denial 输出；
+4. 允许重试：重新走审批（除非已有批准且策略允许复用）；
+5. 第二次 attempt 使用升级后的 sandbox/权限；
+6. 成功则仍然只返回这一条 tool call 的结果。
+
+strict auto review 下，sandboxed attempt 和 unsandboxed retry 不能共享同一次 Guardian 结论，
+重试必须重新审查。若 permission profile 含 denied reads，简单去掉 sandbox 会静默放开本应拒绝的读取，
+因此代码会保留 sandbox 限制，只做受限提权。
+
+`AskForApproval::Never` 和部分 `OnRequest` 情况不会走“失败后再问用户”的无限升级循环；
+具体由 tool 的 `wants_no_sandbox_approval` 和 policy 决定。
+
+#### g. network proxy：命令批准了，也不代表某个 host 可访问
+
+文件系统 sandbox 和网络权限是两套边界。一个命令可以获准启动，但当它尝试连接未授权的 host 时，
+network proxy 仍然会拦截。`NetworkApprovalService` 在真实连接发生时执行另一层判断。
+
+流程大致是：
+
+```text
+命令获得 exec approval 并启动
+  → 进程发起 HTTP/HTTPS/SOCKS 请求
+  → network proxy 匹配 allowed/denied domains
+  → 不在 allowlist → inline policy decision = ask
+  → NetworkApprovalService::handle_inline_policy_request
+       → session allow/deny cache
+       → Guardian 或用户审批
+       → allow once / allow session / deny / persist rule
+  → 放行或断开连接
+```
+
+几个容易混淆的点：
+
+- 命令级 approval 和 host 级 approval 是两次独立决定；
+- 只有 `PermissionProfile::Managed` 才允许走网络审批流程；
+- `AskForApproval::Never` 下未授权网络请求直接拒绝；
+- 显式 deny 的域名不能靠“这次批准”覆盖；
+- 并发命令共享 proxy 时，系统必须靠 execution id 或唯一 active call 归属请求；
+  无法可靠归属时宁可拒绝，不猜是哪个命令。
+
+`DeferredNetworkApproval` 还会在工具主体结束后检查是否仍有 pending 网络审批，
+避免命令已经报告完成、proxy 随后才异步拒绝，导致结果不一致。
+
+#### h. MCP 工具审批
+
+MCP 没有 shell command，所以 execpolicy 不适用；它有独立的 server/tool approval mode：
+
+| `AppToolApproval` | 行为 |
+|---|---|
+| `auto` | 根据 MCP annotations；read-only 可免审批，destructive/open-world/未知风险要审批 |
+| `prompt` | 每次调用都审批 |
+| `writes` | read-only 工具免审批，其余审批 |
+| `approve` | 不要求审批 |
+
+`McpHandler` 在把 `tools/call` 发给 server 之前调用 `maybe_request_mcp_tool_approval`。
+审批上下文包含 server、tool、参数、connector、tool title/description 和 annotations，
+必要时通过 MCP elicitation 或普通 request-user-input 展示。
+
+批准可以只生效一次、记住当前 session，或者按策略持久化。MCP server 本身可能有远程副作用，
+所以这层审批发生在网络请求之前，而不是事后检查结果。
+
+#### i. `request_permissions`：主动申请更多能力
+
+`request_permissions` 是一个单独的模型工具。它不执行命令，只请求额外的文件读、写或网络权限：
+
+- `AskForApproval::Never`：直接返回空权限；
+- granular 禁止该项：直接返回空权限；
+- 否则先走 Guardian，Guardian 不认领再询问用户。
+
+批准后返回一个 `RequestPermissionsResponse`，权限可能只作用于当前 turn，也可能作用于 session。
+后续 shell-like 命令会读取这些 turn grants。模型不能通过该工具绕过 managed requirements 或显式 deny；
+host 会对路径和权限 profile 再次 normalize。
+
+#### j. Guardian 同步审查：独立的决策上下文
+
+Guardian 不是让主模型“再想一遍”。同步审查使用独立的 review session，并由
+`codex-guardian-context` 组装有界上下文。`ContextTarget::Sync` 与
+`ContextTarget::Async`（`codex-rs/guardian-context/src/lib.rs:110`）让同一组 section contributor
+只向对应 consumer 提供内容。
+
+section 主要包括：
+
+- 用户原始请求、当前 conversation transcript、retained user instructions；
+- exact planned action 与参数；
+- resolved permission context；
+- previous Guardian reviews；
+- trusted tool/skill metadata；
+- 相关图片和 Code Mode evidence。
+
+每个 section 有 `Shared` / `SyncOnly` / `AsyncOnly` 作用域
+（`guardian-context/src/lib.rs:119`），并受 count/byte/token budget 限制。
+required evidence 缺失时 `SectionError` 会让审查失败关闭，而不是拿残缺上下文做“也许没问题”的判断。
+
+同步 review 默认有 90 秒 deadline，最多 3 次尝试（`codex-rs/ext/guardian-reviewer/src/lib.rs:40`）。
+超时、解析失败、无法建立上下文、授权版本变化都按 fail-closed 处理；连续 deny 达到阈值还可能
+直接中断当前 turn。
+
+#### k. Guardian V2 异步评分：快路径，不是绕过审批
+
+Guardian V2 还可以在工具事件发生后异步分类动作风险。评分器读取同一个 bounded context，
+产出 `action_risk` 的 `high`/`low` 分数，并把 score 绑定到 `call_id`、`sampled_at`、
+authorization version 和 review-context revision。
+
+下一次 approval 到来时，`GuardianApprovalReviewer` 可以：
+
+- 当前 score 足够新、授权未变化且低于阈值：走 cached approval 快路径；
+- score 过高、缺失、过期、上下文不兼容或动作要求 fresh review：进入同步 review；
+- 异步 scorer 不可用：回退同步 review，而不是隐式 allow。
+
+所以异步评分的价值是减少常见低风险动作的审批延迟，不是把安全决策变成“后台跑完就算了”。
+
+#### l. 拒绝如何回到模型
+
+审批拒绝最终沿 §7 的结果链路回灌：
+
+- `Denied(reason)` → `ToolError::Rejected` → 模型看到拒绝原因，可以换安全方案；
+- `TimedOut` → 返回自动审查超时说明，仍不执行；
+- `Abort` → `CodexErr::TurnAborted`，结束当前 turn；
+- sandbox denial → 通常作为工具失败输出返回，包含沙箱拒绝信息；
+- network deny → 在具体请求层返回 blocked host/reason，并让本次工具调用失败。
+
+“拒绝后继续让模型想办法”和“立即中止 turn”刻意分开。前者适合路径错误、host 不在 allowlist；
+后者适合用户明确叫停、连续高风险尝试或授权上下文已失效。
 
 ### ④ 取舍
 
-- 安全 vs 流畅：审批骚扰会让人关掉保护
-- 为什么 Guardian 要单独起一次模型调用，而不是让主模型自审
-- 与 LangChain / Dify 的对比：为什么通用框架在这一层几乎空白
+**为什么审批和 sandbox 不合并。** 审批回答“这个动作是否被授权尝试”，sandbox 回答“即使允许尝试，
+进程实际能碰什么”。合并后，用户批准一条命令就很容易被误解为获得 unrestricted 权限。
+拆开的代价是同一动作可能要经过命令级和 host 级两次判断。
+
+**为什么先走 execpolicy 再问人。** 所有命令都弹窗会让用户迅速麻木，最后形成无脑 approve；
+显式 allow/forbidden 规则和危险启发式先减少无意义提示。代价是规则作者必须理解 shell 解析、
+复合命令和 sandbox bypass 的边界。
+
+**为什么 sandbox denial 后还要升级重试。** 只读 sandbox 已经足够时不应一开始就要求 unsandboxed；
+失败后按 tool/policy 决定是否提出升级，能缩小高权限窗口。代价是流程更长，且重试必须防止
+“一次批准覆盖两次不同尝试”的漏洞，所以 strict review 会重新审查。
+
+**为什么网络审批发生在代理层。** 进程可能在运行时才决定访问哪个 host，静态检查 command 字符串无法可靠
+知道最终目标。proxy 在连接点看到真实 host/protocol/port，才能做 host 级策略。
+代价是命令审批与网络审批是两次独立交互，并需要处理并发请求归属和延迟清理。
+
+**为什么 Guardian 单独起审查上下文。** 主模型既是动作提出者，又掌握大量不可信工具输出；
+让它自审会复用被污染的前提。独立 reviewer 有单独 instructions、bounded evidence 和明确
+allow/deny 输出，更容易防止 prompt injection。代价是额外模型调用、延迟和上下文预算。
+
+**为什么需要异步风险评分。** 每个低风险动作都同步起 reviewer 会明显拖慢 turn。异步 scorer
+先把常见动作分级，审批时只复核高风险或证据不新鲜的动作。代价是缓存、授权版本和 score freshness
+必须严格绑定，否则旧分数会批准新动作。
+
+**为什么通用 agent 框架很难直接复用这一层。** 常见框架通常提供 human-in-the-loop callback，
+但命令语义解析、platform sandbox、网络代理、permission profile、approval cache 和 reviewer
+往往要由应用自己组合。它们的 API 也在持续变化，这里不做具体产品能力断言；Codex 的特点是把这些边界
+放进主执行链路，而不是留给工具实现者自行遵守。
+
+回到主流程：§8 执行完成后，工具只可能得到三类结果：获准并执行、因策略/审批失败而回灌拒绝、
+或整轮 abort。拒绝不是“静默吞掉”，而是和 sandbox/network 的实际约束一起成为下一轮模型请求的输入。
 
 ---
 
