@@ -47,7 +47,7 @@ commit  8c3612fb638d356579c446de68421288164484dc
 | [act-01-minimal-loop.md](act-01-minimal-loop.md) | 2284 | **第一幕 · 最小闭环**：§1 启动与线程模型、§2 turn 生命周期、§3 模型接入、§4 上下文组装、§5 world state 与增量渲染 | ✅ 完成 |
 | [act-02-tool-loop.md](act-02-tool-loop.md) | 1208 | **第二幕 · 工具循环**：§6 工具抽象、§7 工具循环与并发、§8 审批与安全边界 | ✅ 完成 |
 | [act-03-memory-and-extensions.md](act-03-memory-and-extensions.md) | 1988 | **第三幕 · 记忆与扩展**：§9 持久化与恢复、§10 Contributor 框架、§11 Skill、§12 Memory、§13 MCP + Plugin + Apps | ✅ 完成 |
-| [act-04-long-session-and-scale.md](act-04-long-session-and-scale.md) | 168 | **第四幕 · 长会话与规模化**：§14 Compaction、§15 多智能体、§16 Code Mode 与 Realtime | 📝 大纲 |
+| [act-04-long-session-and-scale.md](act-04-long-session-and-scale.md) | 1327 | **第四幕 · 长会话与规模化**：§14 Compaction、§15 多智能体、§16 Code Mode 与 Realtime，以及全系列收束 | ✅ 完成 |
 
 节号 **1–16 跨四幕连续编号**，所以「第 N 节」全局唯一。
 
